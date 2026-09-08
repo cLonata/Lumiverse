@@ -58,6 +58,8 @@ export interface ColorAttribution {
   entityName: string | null;
   usageType: ColorUsageType;
   confidence: number;
+  /** Colored text retained for deferred, source-validated persistence. */
+  sampleExcerpt?: string | null;
 }
 
 export interface ThoughtDelimiters {
@@ -763,7 +765,9 @@ export function processChunkFontColors(
   knownEntityNames: string[],
   entityIdByName: Map<string, string>,
   thoughtDelimiters?: ThoughtDelimiters,
+  options: { persist?: boolean } = {},
 ): { strippedContent: string; attributions: ColorAttribution[] } {
+  const persist = options.persist !== false;
   const blocks = extractColorBlocks(content, thoughtDelimiters);
   if (blocks.length === 0) {
     return { strippedContent: stripThoughtDelimiters(content, thoughtDelimiters), attributions: [] };
@@ -801,7 +805,9 @@ export function processChunkFontColors(
     // Check existing high-confidence mapping first
     const existing = lookupColor(chatId, block.hexColor);
     if (existing && existing.entityId) {
-      recordColorAttribution(chatId, block.hexColor, existing.entityId, block.usageType, block.content.slice(0, 80));
+      if (persist) {
+        recordColorAttribution(chatId, block.hexColor, existing.entityId, block.usageType, block.content.slice(0, 80));
+      }
       const entityName = knownEntityNames.find((n) => entityIdByName.get(n.toLowerCase()) === existing.entityId);
       blockResults.push({
         block,
@@ -810,6 +816,7 @@ export function processChunkFontColors(
           entityName: entityName || null,
           usageType: existing.usageType,
           confidence: existing.confidence,
+          sampleExcerpt: block.content.slice(0, 80),
         },
         fromExisting: true,
       });
@@ -831,6 +838,7 @@ export function processChunkFontColors(
         entityName: attr.entityName,
         usageType: block.usageType,
         confidence: attr.confidence,
+        sampleExcerpt: block.content.slice(0, 80),
       },
       fromExisting: false,
     });
@@ -918,7 +926,9 @@ export function processChunkFontColors(
 
     if (result.attribution.entityName) {
       const entityId = entityIdByName.get(result.attribution.entityName.toLowerCase()) || null;
-      recordColorAttribution(chatId, result.block.hexColor, entityId, result.block.usageType, result.block.content.slice(0, 80));
+      if (persist) {
+        recordColorAttribution(chatId, result.block.hexColor, entityId, result.block.usageType, result.block.content.slice(0, 80));
+      }
     }
     attributions.push(result.attribution);
   }

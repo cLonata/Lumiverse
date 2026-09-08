@@ -16,6 +16,7 @@
  */
 
 import { getDb } from "../../db/connection";
+import { createHash } from "crypto";
 import { loadChatChunkTopology } from "../chat-chunk-ordering";
 import {
   getCortexConfig,
@@ -1005,6 +1006,90 @@ export async function queryCortex(
 
 // ─── Ingestion Pipeline ────────────────────────────────────────
 
+export interface ChunkSourceRow {
+  id: string;
+  chat_id: string;
+  start_message_id: string;
+  end_message_id: string;
+  message_ids: string;
+  content: string;
+  token_count: number;
+  message_count: number;
+  updated_at: number;
+  created_at: number;
+}
+
+function supersedeIngestionTracking(userId: string, chatId: string): void {
+  const current = getOrCreateIngestionStatus(chatId);
+  const pendingJobs = Math.max(0, current.pendingJobs - 1);
+  updateIngestionStatus(userId, chatId, {
+    status: pendingJobs > 0 ? "processing" : "complete",
+    phase: pendingJobs > 0 ? "queued" : "complete",
+    startedAt: pendingJobs > 0 ? current.startedAt : null,
+    pendingJobs,
+    error: undefined,
+  });
+}
+
+export type ChunkSourceGeneration = string;
+
+const CHUNK_SOURCE_COLUMNS = `id, chat_id, start_message_id, end_message_id,
+  message_ids, content, token_count, message_count, updated_at, created_at`;
+
+export function fingerprintChunkSource(row: ChunkSourceRow): ChunkSourceGeneration {
+  return createHash("sha256").update(JSON.stringify([
+    row.id, row.chat_id, row.start_message_id, row.end_message_id,
+    row.message_ids, row.content, row.token_count, row.message_count,
+    row.updated_at, row.created_at,
+  ])).digest("hex");
+}
+
+function readChunkSourceRow(chunkId: string, chatId: string): ChunkSourceRow | null {
+  return getDb()
+    .query(`SELECT ${CHUNK_SOURCE_COLUMNS} FROM chat_chunks WHERE id = ? AND chat_id = ?`)
+    .get(chunkId, chatId) as ChunkSourceRow | null;
+}
+
+function readChunkSourceGeneration(chunkId: string, chatId: string): ChunkSourceGeneration | null {
+  const row = readChunkSourceRow(chunkId, chatId);
+  return row ? fingerprintChunkSource(row) : null;
+}
+
+function isExpectedChunkSourceCurrent(
+  chunkId: string,
+  chatId: string,
+  expected: ChunkSourceGeneration | undefined,
+): boolean {
+  return expected === undefined || readChunkSourceGeneration(chunkId, chatId) === expected;
+}
+
+function throwIfSchedulerAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw signal.reason ?? new DOMException("Cortex ingest superseded", "AbortError");
+  }
+}
+
+function waitForRetryDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) {
+    throwIfSchedulerAborted(signal);
+    return Promise.resolve();
+  }
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  throwIfSchedulerAborted(signal);
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason ?? new DOMException("Cortex ingest superseded", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /**
  * Process a newly created chat chunk through the cortex pipeline.
  *
@@ -1033,30 +1118,41 @@ export function scheduleProcessChunk(
   sidecarConnectionId?: string,
   descriptionAliases?: Map<string, string>,
 ): Promise<ChatPipelineTaskResult<void>> {
-  const db = getDb();
-  const queuedRow = db
-    .query("SELECT updated_at FROM chat_chunks WHERE id = ? AND chat_id = ?")
-    .get(data.chunkId, data.chatId) as { updated_at?: number } | null;
-  const queuedRevision = queuedRow?.updated_at ?? null;
+  const scheduledSourceRow = readChunkSourceRow(data.chunkId, data.chatId);
+  const expectedSourceGeneration = scheduledSourceRow
+    ? fingerprintChunkSource(scheduledSourceRow)
+    : null;
+  const scheduledData: ChunkIngestionData = scheduledSourceRow
+    ? {
+        ...data,
+        content: scheduledSourceRow.content,
+        messageIds: safeJsonArray(scheduledSourceRow.message_ids),
+        createdAt: scheduledSourceRow.created_at,
+      }
+    : data;
 
   return enqueueChatPipelineTask({
     chatId: data.chatId,
     kind: "cortex_ingest",
     dedupeKey: data.chunkId,
-    revision: queuedRevision,
+    revision: expectedSourceGeneration,
     preflight: () => {
       const cfg = getCortexConfig(data.userId);
       if (!isCortexEnabledForStoredChat(data.userId, data.chatId, cfg)) {
         return { action: "skip", reason: "cortex_disabled" } as const;
       }
+      if (expectedSourceGeneration === null) {
+        return { action: "skip", reason: "chunk_missing_at_schedule" } as const;
+      }
 
-      const row = db
+      const row = getDb()
         .query(
-          "SELECT updated_at, cortex_warmup_signature FROM chat_chunks WHERE id = ? AND chat_id = ?",
+          `SELECT ${CHUNK_SOURCE_COLUMNS}, cortex_warmup_signature
+           FROM chat_chunks WHERE id = ? AND chat_id = ?`,
         )
-        .get(data.chunkId, data.chatId) as { updated_at?: number; cortex_warmup_signature?: string | null } | null;
+        .get(data.chunkId, data.chatId) as (ChunkSourceRow & { cortex_warmup_signature?: string | null }) | null;
       if (!row) return { action: "skip", reason: "chunk_deleted" } as const;
-      if (queuedRevision != null && row.updated_at !== queuedRevision) {
+      if (expectedSourceGeneration !== null && fingerprintChunkSource(row) !== expectedSourceGeneration) {
         return { action: "skip", reason: "chunk_revised" } as const;
       }
       if (row.cortex_warmup_signature === getCortexStructuralSignature(cfg)) {
@@ -1064,12 +1160,15 @@ export function scheduleProcessChunk(
       }
       return { action: "run" } as const;
     },
-    run: () => processChunk(
-      data,
+    run: (signal) => processChunk(
+      scheduledData,
       characterNames,
       generateRawFn,
       sidecarConnectionId,
       descriptionAliases,
+      undefined,
+      signal,
+      expectedSourceGeneration ?? undefined,
     ),
   });
 }
@@ -1096,7 +1195,12 @@ export async function processChunk(
    *  External callers should normally use scheduleProcessChunk() so chunk
    *  rebuilds, warmups, and live ingests share the same chat-scoped lane. */
   precomputedHeuristic?: import("./heuristic-runtime").HeuristicAnalysisOutput,
+  /** Coordinator-owned cancellation is passed only by live ingestion. */
+  externalSignal?: AbortSignal,
+  /** Exact snapshot of the stored source-bearing chunk fields for live ingestion. */
+  expectedSourceGeneration?: ChunkSourceGeneration,
 ): Promise<void> {
+  throwIfSchedulerAborted(externalSignal);
   const config = getCortexConfig(data.userId);
   if (!isCortexEnabledForStoredChat(data.userId, data.chatId, config)) return;
   const sidecarActive = shouldUseCortexSidecarForChunkAnalysis(config) && !!generateRawFn && !!sidecarConnectionId;
@@ -1136,6 +1240,7 @@ export async function processChunk(
       hydratedChunkContent,
       { characterId: data.characterId, chatId: data.chatId },
     );
+    throwIfSchedulerAborted(externalSignal);
     // Strip non-prose markup (HTML, <details>, <lumia_ooc>, scaffold blocks,
     // user-defined HUD tags, etc.) before any evaluator sees the chunk —
     // keeps font tags so attribution still works.
@@ -1185,6 +1290,7 @@ export async function processChunk(
       [...new Set([...characterNames, ...knownEntities.map((e) => e.name)])],
       entityIdByName,
       thoughtDelimiters,
+      { persist: false },
     );
     timings.fontMs = performance.now() - fontStart;
     const cleanContent = fontResult.strippedContent;
@@ -1243,6 +1349,7 @@ export async function processChunk(
     } | undefined;
     if (arbiterActive && heuristicPromise) {
       heuristicResult = await heuristicPromise;
+      throwIfSchedulerAborted(externalSignal);
       timings.heuristicMs = heuristicResult.timings.totalMs;
       timings.heuristicSalienceMs = heuristicResult.timings.salienceMs;
       timings.heuristicEntityMs = heuristicResult.timings.entityMs;
@@ -1269,10 +1376,12 @@ export async function processChunk(
       // tokenizer is available — never throws.
       try {
         const resolved = await resolveCounter(config.sidecar.model || "");
+        throwIfSchedulerAborted(externalSignal);
         liveSidecarTokenCounter = resolved.count;
       } catch {
         liveSidecarTokenCounter = undefined;
       }
+      throwIfSchedulerAborted(externalSignal);
       const sidecarStart = performance.now();
       const maxAttempts = 1 + (config.sidecarReliability.maxRetries ?? 0);
       const baseDelayMs = config.sidecarReliability.retryDelayMs ?? 500;
@@ -1281,12 +1390,15 @@ export async function processChunk(
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         if (attempt > 0) {
           const delay = baseDelayMs * Math.pow(2, attempt - 1);
-          await new Promise((resolve) => setTimeout(resolve, delay));
+          await waitForRetryDelay(delay, externalSignal);
           console.info(`[memory-cortex] Sidecar retry attempt ${attempt + 1}/${maxAttempts} after ${delay}ms`);
         }
 
         const sidecarTimeout = config.sidecarTimeoutMs ?? 30000;
         const ac = sidecarTimeout > 0 ? new AbortController() : null;
+        const attemptSignal = externalSignal && ac
+          ? AbortSignal.any([externalSignal, ac.signal])
+          : externalSignal ?? ac?.signal;
         const timer = ac ? setTimeout(() => {
           console.warn("[memory-cortex] Sidecar extraction timed out, aborting LLM call");
           ac.abort();
@@ -1306,15 +1418,17 @@ export async function processChunk(
               tokenCounter: liveSidecarTokenCounter,
               logTag: `live chunk=${data.chunkId.slice(0, 8)} attempt=${attempt + 1}/${maxAttempts}`,
               throwOnFailure: true,
-              signal: ac?.signal,
+              signal: attemptSignal,
             },
           );
+          throwIfSchedulerAborted(externalSignal);
           lastErr = null;
           break;
         } catch (err: any) {
+          throwIfSchedulerAborted(externalSignal);
           lastErr = err;
-          const isAbort = err?.name === "AbortError" || ac?.signal.aborted;
-          if (!isAbort) {
+          const attemptTimedOut = ac?.signal.aborted === true;
+          if (!attemptTimedOut && err?.name !== "AbortError") {
             console.warn(`[memory-cortex] Sidecar attempt ${attempt + 1}/${maxAttempts} failed:`, err?.message ?? err);
           }
         } finally {
@@ -1324,6 +1438,7 @@ export async function processChunk(
       timings.sidecarMs = performance.now() - sidecarStart;
 
       if (!extraction && lastErr) {
+        throwIfSchedulerAborted(externalSignal);
         if (config.sidecarReliability.fallback === "skip") {
           console.warn(
             `[memory-cortex] Sidecar failed after ${maxAttempts} attempt(s); skipping chunk persistence ` +
@@ -1338,6 +1453,7 @@ export async function processChunk(
 
     if (heuristicPromise && !heuristicResult) {
       heuristicResult = await heuristicPromise;
+      throwIfSchedulerAborted(externalSignal);
       timings.heuristicMs = heuristicResult.timings.totalMs;
       timings.heuristicSalienceMs = heuristicResult.timings.salienceMs;
       timings.heuristicEntityMs = heuristicResult.timings.entityMs;
@@ -1384,21 +1500,6 @@ export async function processChunk(
       sidecarDiscoveredAliases = extraction.discoveredAliases;
       sidecarGrading = extraction.gradedHeuristics;
 
-      if (extraction.fontColors.length > 0) {
-        const dbStart = performance.now();
-        for (const fc of extraction.fontColors) {
-          if (!isAllowedColorName(fc.characterName)) continue;
-          // Only write here if the character is already persisted. Otherwise
-          // skip and let the post-ingest transactional write below handle it
-          // once the entity has been created — that avoids stamping a
-          // null-entity ("Unattributed") row that the later write can't always
-          // reliably replace.
-          const entityId = entityIdByName.get(fc.characterName.toLowerCase());
-          if (!entityId) continue;
-          recordColorAttribution(data.chatId, fc.hexColor, entityId, fc.usageType as any, null);
-        }
-        timings.dbMs += performance.now() - dbStart;
-      }
     } else if (heuristicResult) {
       salienceResult = heuristicResult.salienceResult;
     } else {
@@ -1410,7 +1511,7 @@ export async function processChunk(
     const chunkStillExists = db
       .query("SELECT 1 FROM chat_chunks WHERE id = ? AND chat_id = ?")
       .get(data.chunkId, data.chatId);
-    if (!chunkStillExists) {
+    if (!chunkStillExists && expectedSourceGeneration === undefined) {
       const skippedTimings: CortexIngestionTimings = {
         mode: extraction ? (heuristicResult ? "mixed" : "sidecar") : "heuristic",
         fontMs: timings.fontMs,
@@ -1432,8 +1533,27 @@ export async function processChunk(
 
     updateIngestionStatus(data.userId, data.chatId, { phase: "persisting", chunkId: data.chunkId });
     const persistStartedAt = performance.now();
-    const deferredFactAutopilot = db.transaction(() => {
+    const persistenceResult = db.transaction(() => {
       let deferredAutopilotEntityId: string | null = null;
+
+      // This read and every derived write below share one synchronous SQLite
+      // transaction. There is no await between generation validation and commit.
+      throwIfSchedulerAborted(externalSignal);
+      if (!isExpectedChunkSourceCurrent(data.chunkId, data.chatId, expectedSourceGeneration)) {
+        return { committed: false as const, deferredAutopilotEntityId: null };
+      }
+      const persistedFontAttributions = new Set<string>();
+      const persistFontAttribution = (
+        hexColor: string,
+        entityId: string,
+        usageType: Parameters<typeof recordColorAttribution>[3],
+        sampleExcerpt: string | null,
+      ) => {
+        const key = `${hexColor.toLowerCase()}\u0000${entityId}\u0000${usageType}`;
+        if (persistedFontAttributions.has(key)) return;
+        persistedFontAttributions.add(key);
+        recordColorAttribution(data.chatId, hexColor, entityId, usageType, sampleExcerpt);
+      };
 
       if (config.salienceScoring) {
         const dbStart = performance.now();
@@ -1564,13 +1684,18 @@ export async function processChunk(
           if (!isAllowedColorName(attr.entityName)) continue;
           const entity = entityGraph.findEntityByName(data.chatId, attr.entityName);
           if (!entity) continue;
-          recordColorAttribution(data.chatId, attr.hexColor, entity.id, attr.usageType, null);
+          persistFontAttribution(
+            attr.hexColor,
+            entity.id,
+            attr.usageType,
+            attr.sampleExcerpt ?? null,
+          );
         }
         for (const fc of sidecarFontColors) {
           if (!isAllowedColorName(fc.characterName)) continue;
           const entity = entityGraph.findEntityByName(data.chatId, fc.characterName);
           if (!entity) continue;
-          recordColorAttribution(data.chatId, fc.hexColor, entity.id, fc.usageType, null);
+          persistFontAttribution(fc.hexColor, entity.id, fc.usageType, null);
         }
         timings.dbMs += performance.now() - dbStart;
 
@@ -1647,6 +1772,29 @@ export async function processChunk(
           ], null, 7, maxFacts);
         }
         timings.graphMs += performance.now() - postGraphStart;
+      }
+
+      // When graph ingestion is disabled, preserve the historical behavior of
+      // reinforcing colors that already resolve to a persisted entity. The
+      // graph-enabled path above persists after newly extracted entities exist.
+      if (!config.entityTracking || config.entityExtractionMode === "off") {
+        for (const attr of fontResult.attributions) {
+          if (!attr.entityName || !isAllowedColorName(attr.entityName)) continue;
+          const entityId = entityIdByName.get(attr.entityName.toLowerCase());
+          if (entityId) {
+            persistFontAttribution(
+              attr.hexColor,
+              entityId,
+              attr.usageType,
+              attr.sampleExcerpt ?? null,
+            );
+          }
+        }
+        for (const fc of sidecarFontColors) {
+          if (!isAllowedColorName(fc.characterName)) continue;
+          const entityId = entityIdByName.get(fc.characterName.toLowerCase());
+          if (entityId) persistFontAttribution(fc.hexColor, entityId, fc.usageType, null);
+        }
       }
 
       // Only runs server-side during sidecar mode (amortized cost acceptable).
@@ -1752,18 +1900,58 @@ export async function processChunk(
         "UPDATE chat_chunks SET cortex_warmup_signature = ?, cortex_warmup_completed_at = ? WHERE id = ?",
       ).run(warmupSignature, now, data.chunkId);
 
-      return deferredAutopilotEntityId;
+      return { committed: true as const, deferredAutopilotEntityId };
     })();
     timings.dbMs += performance.now() - persistStartedAt;
+
+    if (!persistenceResult.committed) {
+      const skippedTimings: CortexIngestionTimings = {
+        mode: extraction ? (heuristicResult ? "mixed" : "sidecar") : "heuristic",
+        ...timings,
+        totalMs: performance.now() - pipelineStartedAt,
+        completedAt: Date.now(),
+        chunkId: data.chunkId,
+      };
+      completeIngestionTracking(data.userId, data.chatId, data.chunkId, skippedTimings);
+      return;
+    }
+    const deferredFactAutopilot = persistenceResult.deferredAutopilotEntityId;
+    const completeTrackedRun = () => {
+      const mode: CortexIngestionTimings["mode"] = extraction
+        ? (heuristicResult ? "mixed" : "sidecar")
+        : "heuristic";
+      completeIngestionTracking(data.userId, data.chatId, data.chunkId, {
+        mode,
+        fontMs: timings.fontMs,
+        heuristicMs: timings.heuristicMs,
+        heuristicSalienceMs: timings.heuristicSalienceMs,
+        heuristicEntityMs: timings.heuristicEntityMs,
+        heuristicRelationshipMs: timings.heuristicRelationshipMs,
+        heuristicAliasMs: timings.heuristicAliasMs,
+        sidecarMs: timings.sidecarMs,
+        graphMs: timings.graphMs,
+        dbMs: timings.dbMs,
+        totalMs: performance.now() - pipelineStartedAt,
+        completedAt: Date.now(),
+        chunkId: data.chunkId,
+      });
+    };
 
     // Fact Auto-Pilot: run LLM curation after the transaction commits
     if (deferredFactAutopilot && config.factManagement.autopilot
       && sidecarActive && generateRawFn && sidecarConnectionId) {
+      throwIfSchedulerAborted(externalSignal);
+      if (!isExpectedChunkSourceCurrent(data.chunkId, data.chatId, expectedSourceGeneration)) {
+        completeTrackedRun();
+        return;
+      }
       const chunkImp = Math.round(salienceResult.score * 10);
       await curateEntityFactsWithLLM(
         deferredFactAutopilot, sidecarFacts, chunkImp,
         config.factManagement.maxFactsPerEntity,
         generateRawFn, sidecarConnectionId, config,
+        externalSignal,
+        () => isExpectedChunkSourceCurrent(data.chunkId, data.chatId, expectedSourceGeneration),
       );
     }
 
@@ -1771,41 +1959,40 @@ export async function processChunk(
     // that received fresh evidence in this chunk. If the arbiter is active,
     // ask it whether to reactivate; otherwise auto-reactivate.
     if (sidecarActive && config.sidecarReliability.arbitratesHeuristics) {
+      throwIfSchedulerAborted(externalSignal);
+      if (!isExpectedChunkSourceCurrent(data.chunkId, data.chatId, expectedSourceGeneration)) {
+        completeTrackedRun();
+        return;
+      }
       await evaluatePendingReactivations(
         data.chatId, proseContent, generateRawFn!, sidecarConnectionId!, config,
+        externalSignal,
+        () => isExpectedChunkSourceCurrent(data.chunkId, data.chatId, expectedSourceGeneration),
       );
     } else {
       // Non-arbiter mode: auto-reactivate any pending relations
+      throwIfSchedulerAborted(externalSignal);
+      if (!isExpectedChunkSourceCurrent(data.chunkId, data.chatId, expectedSourceGeneration)) {
+        completeTrackedRun();
+        return;
+      }
       autoReactivatePendingRelations(data.chatId);
     }
-
-    const mode: CortexIngestionTimings["mode"] = extraction
-      ? (heuristicResult ? "mixed" : "sidecar")
-      : "heuristic";
-    const completedTimings: CortexIngestionTimings = {
-      mode,
-      fontMs: timings.fontMs,
-      heuristicMs: timings.heuristicMs,
-      heuristicSalienceMs: timings.heuristicSalienceMs,
-      heuristicEntityMs: timings.heuristicEntityMs,
-      heuristicRelationshipMs: timings.heuristicRelationshipMs,
-      heuristicAliasMs: timings.heuristicAliasMs,
-      sidecarMs: timings.sidecarMs,
-      graphMs: timings.graphMs,
-      dbMs: timings.dbMs,
-      totalMs: performance.now() - pipelineStartedAt,
-      completedAt: Date.now(),
-      chunkId: data.chunkId,
-    };
-    completeIngestionTracking(data.userId, data.chatId, data.chunkId, completedTimings);
+    completeTrackedRun();
   } catch (err: any) {
-    failIngestionTracking(data.userId, data.chatId, err?.message || "Cortex ingestion failed");
+    if (externalSignal?.aborted) {
+      supersedeIngestionTracking(data.userId, data.chatId);
+    } else {
+      failIngestionTracking(data.userId, data.chatId, err?.message || "Cortex ingestion failed");
+    }
     throw err;
   }
 
   // ── Consolidation Check ──
 
-  if (config.consolidation.enabled) {
+  if (config.consolidation.enabled
+    && !externalSignal?.aborted
+    && isExpectedChunkSourceCurrent(data.chunkId, data.chatId, expectedSourceGeneration)) {
     // Run async — don't block the ingestion pipeline
     consolidation
       .maybeConsolidate(
@@ -2523,7 +2710,10 @@ async function curateEntityFactsWithLLM(
   }) => Promise<{ content: string; tool_calls?: Array<{ name: string; args: Record<string, unknown> }> }>,
   connectionId: string,
   config: MemoryCortexConfig,
+  signal?: AbortSignal,
+  sourceIsCurrent: () => boolean = () => true,
 ): Promise<void> {
+  throwIfSchedulerAborted(signal);
   // Read raw facts WITH importance tags to preserve provenance
   const entity = entityGraph.getEntity(entityId);
   if (!entity || entity.facts.length <= maxFacts) return;
@@ -2569,7 +2759,10 @@ ${scoredFacts.map((f, i) => `${i + 1}. [salience:${f.importance}] ${f.text}`).jo
         max_tokens: 2048,
         temperature: 0.1,
       },
+      signal,
     });
+    throwIfSchedulerAborted(signal);
+    if (!sourceIsCurrent()) return;
 
     const text = result.content.trim();
     const jsonMatch = text.match(/\[[\s\S]*\]/);
@@ -2603,6 +2796,7 @@ ${scoredFacts.map((f, i) => `${i + 1}. [salience:${f.importance}] ${f.text}`).jo
       `UPDATE memory_entities SET facts = ?, fact_extraction_status = 'ok', updated_at = ? WHERE id = ?`,
     ).run(JSON.stringify(tagged), now, entityId);
   } catch (err) {
+    throwIfSchedulerAborted(signal);
     console.warn("[memory-cortex] Fact autopilot LLM call failed, keeping score-based result:", err);
   }
 }
@@ -2645,7 +2839,10 @@ async function evaluatePendingReactivations(
   }) => Promise<{ content: string; tool_calls?: Array<{ name: string; args: Record<string, unknown> }> }>,
   connectionId: string,
   config: MemoryCortexConfig,
+  signal?: AbortSignal,
+  sourceIsCurrent: () => boolean = () => true,
 ): Promise<void> {
+  throwIfSchedulerAborted(signal);
   const db = getDb();
   const pendingRows = db.query(
     `SELECT r.id, r.source_entity_id, r.target_entity_id, r.relation_type,
@@ -2705,7 +2902,10 @@ Only include entries where you have a clear signal. Omit entries you're unsure a
         max_tokens: 1024,
         temperature: 0.1,
       },
+      signal,
     });
+    throwIfSchedulerAborted(signal);
+    if (!sourceIsCurrent()) return;
 
     const text = result.content.trim();
     const jsonMatch = text.match(/\[[\s\S]*\]/);
@@ -2743,6 +2943,8 @@ Only include entries where you have a clear signal. Omit entries you're unsure a
       if (!decided.has(c.id)) entityGraph.dismissReactivation(c.id);
     }
   } catch (err) {
+    throwIfSchedulerAborted(signal);
+    if (!sourceIsCurrent()) return;
     console.warn("[memory-cortex] Relationship reactivation arbiter failed, auto-reactivating:", err);
     for (const c of candidates) entityGraph.reactivateRelation(c.id);
   }

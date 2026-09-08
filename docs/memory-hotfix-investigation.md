@@ -1,7 +1,7 @@
 # Memory/LTM/Cortex Hotfix Investigation
 
 **Branch:** `test/memory-hotfix`  
-**Status:** Patches A and B are implemented and regression-tested. Bug C remains proposed and unfixed. No production deployment is claimed.
+**Status:** Patches A, B, and C are implemented and regression-tested. No production deployment is claimed.
 **Evidence convention:** **[Code]** is directly established by the checked-out source. **[Production]** is a value or event reported from the real incident's logs/database evidence. **[Inference]** is an engineering conclusion consistent with the first two, but not independently proven by them. **[Open]** is not yet established.
 
 ## Executive Summary
@@ -168,6 +168,30 @@ An active long Cortex ingest can make a rebuild appear in-flight for minutes bef
 
 Separate lifecycle states at minimum: `queued`, `running`, and `follow-up-required`. The surgical decision must not use an umbrella promise as evidence that a rebuild body is currently modifying the chunk graph. **[Inference]** A stronger design records and merges canonical affected ranges/revisions while queued and lets the single eventual task calculate a fresh anchor at execution time. **[Inference]**
 
+### Patch C implementation
+
+Patch C addresses only the demonstrated active-live-ingest delay. Every queued `cortex_ingest` is still superseded by an exclusive task as before. In addition, submission of `chunk_rebuild` records `superseded_by_chunk_rebuild` on an active `cortex_ingest` and aborts that task's coordinator-owned controller exactly once. The lane does not race or detach the cancelled promise: it awaits the ingest until it actually unwinds, settles the ingest as `superseded`, and only then starts the rebuild. An active `cortex_rebuild` or `cortex_warmup` is not preempted. **[Implemented and regression-tested]**
+
+Scheduler supersession is classified from the coordinator's recorded reason plus its controller state, not from an exception name. Consequently an ordinary provider `AbortError`, a per-attempt timeout, and other task failures retain ordinary failure/retry behavior. Live sidecar attempts combine the external scheduler signal with a separate timeout controller; the external signal stops RPM waiting, provider work, retry backoff, fallback, warmup stamping, post-transaction work, and consolidation launch. Attempt timeout remains eligible for the configured retry/fallback policy. **[Implemented and regression-tested]**
+
+Live ingestion now reads one coherent current `chat_chunks` source row. That same row supplies both the scheduled ingestion payload (`content`, parsed `message_ids`, and `created_at`) and a stable local fingerprint of the exact stored source fields: `id`, `chat_id`, `start_message_id`, `end_message_id`, raw stored `message_ids`, `content`, `token_count`, `message_count`, `updated_at`, and `created_at`. Delayed caller payload is therefore never paired with a newer database fingerprint. Preflight compares the current row to that snapshot. Immediately before main persistence, the same fields are re-read and compared inside the synchronous SQLite transaction that performs salience, entity, relation, font-attribution, and warmup-signature writes. A missing or changed row performs none of those main writes; same-second changes are detected independently of `updated_at`. **[Implemented and regression-tested]**
+
+Font parsing now supports analysis without persistence. Live ingestion retains pending sample excerpts and applies deduplicated heuristic/existing-map reinforcement plus sidecar color attribution only inside the validated main transaction. Fact Auto-Pilot and relationship reactivation receive the external signal, do not start after cancellation/staleness, and re-check cancellation and source generation after an awaited sidecar call before their final mutation. A stale or superseded live ingest does not launch `maybeConsolidate()`. **[Implemented and regression-tested]**
+
+Regression tests cover signal-aware and signal-ignoring coordinator tasks, unwind-before-rebuild ordering, explicit supersession classification, ordinary failures, queued supersession, repeated rebuild submission, cross-chat independence, lane continuation, coherent delayed source payloads, source fingerprint changes (including same-second changes), missing/stale transactional rejection, cancellation versus timeout/retry behavior, abort-aware backoff, deferred font writes and sample evidence, consolidation suppression, Patch B coalesced caller settlement, surgical scope during cancellation, and no ingest/rebuild persistence overlap. **[Implemented and regression-tested]**
+
+### Patch C validation results
+
+| Selection | Result | Assertions | Files |
+| --- | --- | ---: | ---: |
+| Targeted Patch C suite | 73 pass / 0 fail | 219 | 4 |
+| Patch A + Patch B + Patch C interaction set | 96 pass / 0 fail | 301 | 6 |
+| Broader memory/chat regression | 166 pass / 0 fail | 519 | 21 |
+
+`git diff --check` passed. Git for Windows emitted LF-to-CRLF conversion warnings only. The broader `chats.service` reduced-fixture tests emitted the already-known, caught asynchronous `no such table: settings` and `no such table: chat_chunks` logs. Those logs did not fail tests and are not classified as Patch C regressions. Production deployment is not claimed.
+
+Explicit follow-up scope remains unchanged: priority/preemption for active or queued `cortex_rebuild` and `cortex_warmup`, stale work from an already-detached consolidation launched by an earlier successful ingest, and graceful shutdown/draining. Patch C does not add a general priority queue, migration, consolidation redesign, or shutdown architecture.
+
 ## Combined Failure Loop
 
 ```text
@@ -206,12 +230,12 @@ Tests should be deterministic and avoid real providers.
 | Out-of-order legacy rows | Insert a chunk whose start message is missing/hidden | Defined deterministic fallback; no accidental timestamp dependence. |
 | Single surgical update | Seed a multi-chunk chat; update a middle/late message | Only canonical suffix is replaced; prefix IDs and warmup signatures remain. |
 | Overlapping surgical requests | Block first rebuild body with a deferred gate; submit a second affected range | One merged/fresh surgical plan executes; no call to full rebuild unless an explicit validated fallback condition occurs. |
-| Queued-versus-running | Start a gated `cortex_ingest`, enqueue surgical rebuild, then send another edit before releasing ingest | Scheduler status distinguishes queued rebuild; second edit does not force a full rebuild merely because queued work exists. |
+| Active live-ingest preemption | Start a signal-aware `cortex_ingest`, enqueue a surgical rebuild, then send another edit while cancellation unwinds | Ingest settles superseded; rebuild starts only after unwind; coalesced edits stay surgical with no persistence overlap. |
 | Active rebuild overlap | Hold a rebuild after its body starts; submit another edit | Correct range/revision follow-up after the active body; test the intended policy explicitly. |
 | Normal generation | Exercise staged blank message followed by final `updateMessage` | Exactly one intended chunk-maintenance request; behavior remains correct under an active Cortex ingest. |
 | Cortex signatures | Full and surgical rebuild fixtures with completed prefix | Preserved rows retain signatures; replaced rows are pending; coverage totals/pending values are correct. |
 | Cortex route telemetry | Fixture with unchanged structural signature and null chunk signatures | `signature_changed=false` can coexist with high pending counts; diagnostic labels do not imply config drift. |
-| Retry starvation | Fake sidecar/ingest delay and retries | Lane observability records active and queue duration; a maintenance request cannot silently be treated as running for the entire delay. |
+| Retry starvation | Fake sidecar/ingest delay and retries | Scheduler cancellation stops live retry/fallback promptly while attempt timeout retains ordinary retry policy. |
 
 The existing `tests/chat-chunk-ordering.test.ts` is the initial characterization test for Bug A. It should pass only after the ordering correction; it is not evidence that Bugs B or C are covered.
 

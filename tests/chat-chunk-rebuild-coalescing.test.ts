@@ -187,22 +187,36 @@ describe("chat chunk rebuild intent coalescing", () => {
     expect(hasFullEmbeddingDelete()).toBe(false);
   });
 
-  test("overlap while the first rebuild is queued remains surgical", async () => {
-    const blocker = deferred();
+  test("slow live ingest is cancelled before coalesced surgical rebuild persistence", async () => {
+    let ingestAlive = false;
+    let persistenceOverlappedIngest = false;
+    (embeddingsSvc.deleteChatChunkEmbeddings as any).mockImplementation(async () => {
+      if (ingestAlive) persistenceOverlappedIngest = true;
+    });
     const blockingTask = enqueueChatPipelineTask({
       chatId: CHAT_ID,
       kind: "cortex_ingest",
-      run: () => blocker.promise,
+      run: async (signal) => {
+        ingestAlive = true;
+        try {
+          await new Promise<void>((_resolve, reject) => {
+            signal!.addEventListener("abort", () => reject(signal!.reason), { once: true });
+          });
+        } finally {
+          ingestAlive = false;
+        }
+      },
     });
     const first = chatsSvc.rebuildChatChunksFromMessages(USER_ID, CHAT_ID, ["m5"]);
     const second = chatsSvc.rebuildChatChunksFromMessages(USER_ID, CHAT_ID, ["m2"]);
 
     expect(chatsSvc.isChatChunkRebuildInProgress(CHAT_ID)).toBe(true);
-    blocker.resolve();
-    await Promise.all([blockingTask, first, second]);
+    const [ingestResult] = await Promise.all([blockingTask, first, second]);
 
+    expect(ingestResult.status).toBe("superseded");
     expect(chunkIds().slice(0, 2)).toEqual(["c0", "c1"]);
     expect(hasFullEmbeddingDelete()).toBe(false);
+    expect(persistenceOverlappedIngest).toBe(false);
   });
 
   test("pending explicit full intent dominates pending surgical intent", async () => {

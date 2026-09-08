@@ -18,6 +18,7 @@ export interface ChatPipelineTaskSnapshot {
   exclusive: boolean;
   enqueuedAt: number;
   startedAt: number | null;
+  supersedeReason: string | null;
 }
 
 export interface ChatPipelineStatus {
@@ -46,7 +47,9 @@ interface QueueTask<T> {
   enqueuedAt: number;
   startedAt: number | null;
   preflight?: () => Promise<PreflightDecision> | PreflightDecision;
-  run: () => Promise<T>;
+  run: (signal?: AbortSignal) => Promise<T>;
+  abortController: AbortController | null;
+  supersedeReason: string | null;
   resolve: (result: ChatPipelineTaskResult<T>) => void;
   reject: (reason?: unknown) => void;
 }
@@ -69,7 +72,7 @@ export interface EnqueueChatPipelineTaskOptions<T> {
   dedupeKey?: string;
   revision?: number | string | null;
   preflight?: () => Promise<PreflightDecision> | PreflightDecision;
-  run: () => Promise<T>;
+  run: (signal?: AbortSignal) => Promise<T>;
 }
 
 const lanes = new Map<string, ChatPipelineLane>();
@@ -108,6 +111,7 @@ function taskToSnapshot(task: QueueTask<unknown>): ChatPipelineTaskSnapshot {
     exclusive: task.exclusive,
     enqueuedAt: task.enqueuedAt,
     startedAt: task.startedAt,
+    supersedeReason: task.supersedeReason,
   };
 }
 
@@ -166,6 +170,14 @@ function supersedeQueuedIngestions(lane: ChatPipelineLane, reason: string): void
   lane.queue = survivors;
 }
 
+function requestActiveIngestSupersession(lane: ChatPipelineLane, reason: string): void {
+  const active = lane.activeTask;
+  if (!active || active.kind !== "cortex_ingest" || active.supersedeReason) return;
+  active.supersedeReason = reason;
+  touchLane(lane);
+  active.abortController?.abort(new DOMException(reason, "AbortError"));
+}
+
 function supersedeQueuedDedupeMatch(
   lane: ChatPipelineLane,
   incomingKind: ChatPipelineTaskKind,
@@ -199,16 +211,28 @@ async function pumpLane(lane: ChatPipelineLane): Promise<void> {
       try {
         if (task.preflight) {
           const decision = await task.preflight();
+          if (task.supersedeReason && task.abortController?.signal.aborted) {
+            settleSuperseded(task, task.supersedeReason, lane);
+            continue;
+          }
           if (decision.action === "skip") {
             settleSkipped(task, decision.reason, lane);
             continue;
           }
         }
 
-        const value = await task.run();
-        settleCompleted(task as QueueTask<unknown>, value, lane);
+        const value = await task.run(task.abortController?.signal);
+        if (task.supersedeReason && task.abortController?.signal.aborted) {
+          settleSuperseded(task, task.supersedeReason, lane);
+        } else {
+          settleCompleted(task as QueueTask<unknown>, value, lane);
+        }
       } catch (err) {
-        task.reject(err);
+        if (task.supersedeReason && task.abortController?.signal.aborted) {
+          settleSuperseded(task, task.supersedeReason, lane);
+        } else {
+          task.reject(err);
+        }
       } finally {
         lane.activeTask = null;
         touchLane(lane);
@@ -238,6 +262,8 @@ export function enqueueChatPipelineTask<T>(
       startedAt: null,
       preflight: options.preflight,
       run: options.run,
+      abortController: options.kind === "cortex_ingest" ? new AbortController() : null,
+      supersedeReason: null,
       resolve,
       reject,
     };
@@ -251,6 +277,9 @@ export function enqueueChatPipelineTask<T>(
 
     if (task.exclusive) {
       supersedeQueuedIngestions(lane, `superseded_by_${task.kind}`);
+      if (task.kind === "chunk_rebuild") {
+        requestActiveIngestSupersession(lane, "superseded_by_chunk_rebuild");
+      }
     }
 
     lane.queue.push(task as QueueTask<unknown>);
