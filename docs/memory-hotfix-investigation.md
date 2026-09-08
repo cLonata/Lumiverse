@@ -1,7 +1,7 @@
 # Memory/LTM/Cortex Hotfix Investigation
 
 **Branch:** `test/memory-hotfix`  
-**Status:** investigation and patch design; no production fix is claimed by this document.  
+**Status:** Patch A is implemented and regression-tested. Bugs B/C remain proposed and unchanged. No production deployment is claimed.
 **Evidence convention:** **[Code]** is directly established by the checked-out source. **[Production]** is a value or event reported from the real incident's logs/database evidence. **[Inference]** is an engineering conclusion consistent with the first two, but not independently proven by them. **[Open]** is not yet established.
 
 ## Executive Summary
@@ -254,3 +254,32 @@ No claim is made that a schema migration is required; determine that after imple
 | Source inspection | Confirmed timestamp ordering in LTM/Cortex paths, `_rebuildInflight`/`_rebuildPending` full escalation, and the serial per-chat coordinator. **[Code]** |
 | This document | Investigation/documentation only; it makes no source-code or README change outside `docs/`. |
 | Test execution | Attempted `bun test tests/chat-chunk-ordering.test.ts`; blocked because `bun` is not installed/available on this environment's `PATH`. The ordering test is expected to characterize the current defect until the corresponding patch is implemented. |
+
+
+### Patch A implementation and validation
+
+- **[Historical implementation]** The first Patch A revision made `getChatChunkTopology(userId, chatId)` map contained chunk message IDs to positions in `getMessages(...).filter(m => m.extra?.hidden !== true)`, grounded in `messages.index_in_chat`. It also put full topology loading on the ordinary append path. The final implementation supersedes that last-chunk design.
+- **[Code]** Validation requires nonempty string-ID arrays, visible membership, ordered contiguous slices, matching start/end boundaries, unique canonical message indexes, and a gap-free partition beginning at the first visible message. An uncovered trailing message suffix is allowed. Duplicate coverage, overlaps, gaps, orphan/hidden IDs, and malformed JSON invalidate the graph. Validation runs both during anchor lookup and inside the surgical body; invalid topology uses the existing full rebuild path without preserving a prefix.
+- **[Code]** Raw diagnostic rows with no visible position sort last; chunk IDs only break ambiguous position ties, never define valid topology. These ambiguous graphs cannot be surgically preserved. The patch does not proactively repair stored corruption on reads.
+- **Initial stock regression before Patch A:** `tests/chat-chunk-ordering.test.ts`: **0 pass / 2 fail**.
+- **Final targeted Patch A regression:** **21 pass / 0 fail**, 69 assertions.
+- **Combined targeted memory regression:** **23 pass / 0 fail**, 82 assertions.
+- **Broader regression selection:** **134 pass / 0 fail** across 19 files, 418 assertions.
+- `chats.service.test.ts` emitted caught asynchronous errors about missing `settings` and `chat_chunks` tables in reduced test fixtures. They did not fail any tests and are not classified as Patch A regressions.
+- **Additional existing suite:** `bun test tests/temporary-chats.test.ts`: **6 pass / 5 fail**, 25 assertions. The five failures report `table characters has no column named library_scope` in the existing character-creation fixture; this patch does not change that schema or fixture. No commit was made because not all targeted tests passed.
+- Bugs B/C, concurrent mutation during existing asynchronous rebuild operations, and production-scale performance validation remain outside Patch A. Historical incident evidence and the proposed B/C work above are unchanged.
+
+### Final Patch A design
+
+- **[Code]** `chat-chunk-ordering.ts` is the low-level dependency shared by chats, LTM fallback, and Memory Cortex. Its cheap path orders chunks with SQL joins from `start_message_id`/`end_message_id` to `messages.index_in_chat`; `created_at` is not a logical-order key. This removes the chats.service-to-memory-cortex reverse dependency.
+- **[Code]** Ordinary chunk listing, recent fallback/candidate queries, consolidation batch selection, and `getLastChatChunk()` use the SQL path. In particular, normal append selection is bounded (`LIMIT 1`) and does not load or parse the visible chat or all chunk `message_ids`.
+- **[Code]** Full topology validation remains explicit for anchor selection and surgical execution. It preserves visible-message ordering, excludes hidden messages, permits only contiguous visible slices, rejects malformed/non-string/orphan/hidden/duplicate/overlapping/gapped chunks and bad boundaries, permits an unchunked trailing suffix, and now also rejects `message_count !== message_ids.length`.
+- **[Code]** Topology reports structural `valid`, coverage `complete`, `coveredMessageCount`, and `visibleMessageCount` separately. A gap-free chunk prefix with an unchunked visible suffix is valid but incomplete; visible messages with zero chunks are likewise unambiguously incomplete.
+- **[Code]** Surgical rebuild and consolidation require structural validity only because they can safely operate on a valid prefix. Cortex rebuild/warmup and vault snapshot/reindex require both validity and complete visible-message coverage; they throw before destructive/copying work and direct repair ownership to chat-memory rebuild.
+- **[Compatibility follow-up]** Existing `memory_consolidations.message_range_start/end` rows contain chunk `created_at` timestamps and existing queries order by those columns. Patch A continues writing timestamp-valued ranges to avoid mixed persisted units. Changing these fields to message indexes requires an explicit compatibility and migration decision outside this patch.
+- **[Schema follow-up]** Patch A does not treat `cortex_vault_chunks.rowid` as durable semantic order. Vault fallback recency retains its existing `source_created_at` behavior. Portable canonical vault ordering requires an explicit `source_order` column or another schema-backed representation in a future patch.
+- **[Audit]** Remaining `chat_chunks.created_at` semantics are intentionally separated: Cortex time-range filtering and decay plus vault `source_created_at` are wall-clock metadata; vectorization queue ordering is work-queue priority; the Cortex chunks route is UI/diagnostic ordering.
+- **[Validated]** Regression coverage includes count mismatch, append fast-path last selection, LTM fallback recency, Cortex candidate recency, consolidation batch order, and structural-validity versus complete-coverage topology state. Patch A is implemented and regression-tested with the final results recorded above.
+- **[Follow-up]** Persisted consolidation `message_range_start/message_range_end` values retain their timestamp-valued historical meaning. Canonical message-index-backed ranges require an explicit migration and compatibility decision before changing these units.
+- **[Follow-up]** Portable vault source ordering remains schema-limited. A future schema-backed `source_order` column or equivalent is required; SQLite `rowid` is not accepted as a durable semantic ordinal.
+- **[Follow-up]** Production-scale performance validation remains outstanding.

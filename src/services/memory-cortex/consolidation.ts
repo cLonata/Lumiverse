@@ -15,6 +15,7 @@
  */
 
 import { getDb } from "../../db/connection";
+import { getCanonicalChatChunkRows, loadChatChunkTopology } from "../chat-chunk-ordering";
 import { stripNonProseTags } from "../../utils/content-sanitizer";
 import type {
   MemoryConsolidation,
@@ -82,6 +83,33 @@ export function deleteConsolidationsForChat(chatId: string): void {
   getDb().query("DELETE FROM memory_consolidations WHERE chat_id = ?").run(chatId);
 }
 
+/** Select the oldest unconsolidated raw chunks in canonical message order. */
+export function getNextUnconsolidatedChunkBatch(chatId: string, limit: number): any[] {
+  const chunks = getCanonicalChatChunkRows(chatId, {
+    unconsolidatedOnly: true,
+    limit,
+  });
+  if (chunks.length === 0) return [];
+  const placeholders = chunks.map(() => "?").join(",");
+  const salienceRows = getDb().query(
+    `SELECT chunk_id, score, emotional_tags FROM memory_salience
+     WHERE chunk_id IN (${placeholders})`,
+  ).all(...chunks.map(chunk => chunk.id)) as Array<{
+    chunk_id: string;
+    score: number;
+    emotional_tags: string | null;
+  }>;
+  const salienceByChunk = new Map(salienceRows.map(row => [row.chunk_id, row]));
+  return chunks.map(chunk => {
+    const salience = salienceByChunk.get(chunk.id);
+    return {
+      ...chunk,
+      salience_score: salience?.score ?? null,
+      salience_emotional_tags: salience?.emotional_tags ?? null,
+    };
+  });
+}
+
 // ─── Consolidation Pipeline ────────────────────────────────────
 
 /**
@@ -124,17 +152,17 @@ export async function maybeConsolidate(
 
   if (!countRow || countRow.count < config.chunkThreshold) return;
 
+  // Structural validity is sufficient here: consolidation only consumes
+  // persisted chunks, so a valid unchunked visible tail can remain pending.
+  // If the source partition is corrupt, chat-chunk rebuild ownership stays
+  // with chats.service and Cortex leaves existing data untouched.
+  if (!loadChatChunkTopology(chatId).valid) {
+    console.warn(`[memory-cortex] Skipping consolidation for chat ${chatId}: invalid chunk topology`);
+    return;
+  }
+
   // Only fetch the batch we actually need
-  const batch = db
-    .query(
-      `SELECT cc.*, ms.score as salience_score, ms.emotional_tags as salience_emotional_tags
-       FROM chat_chunks cc
-       LEFT JOIN memory_salience ms ON ms.chunk_id = cc.id
-       WHERE cc.chat_id = ? AND cc.consolidation_id IS NULL
-       ORDER BY cc.created_at ASC
-       LIMIT ?`,
-    )
-    .all(chatId, config.chunksPerConsolidation) as any[];
+  const batch = getNextUnconsolidatedChunkBatch(chatId, config.chunksPerConsolidation);
 
   let summary: string;
   let title: string | null = null;
@@ -215,10 +243,10 @@ export async function maybeConsolidate(
     consolidationId, chatId, title, summary,
     JSON.stringify(batch.map((c: any) => c.id)),
     JSON.stringify([...entityIdSet]),
-    batch[0].created_at,
-    batch[batch.length - 1].created_at,
-    batch[0].created_at,
-    batch[batch.length - 1].created_at,
+    Math.min(...batch.map((chunk: any) => chunk.created_at)),
+    Math.max(...batch.map((chunk: any) => chunk.created_at)),
+    Math.min(...batch.map((chunk: any) => chunk.created_at)),
+    Math.max(...batch.map((chunk: any) => chunk.created_at)),
     salienceCount > 0 ? salienceSum / salienceCount : 0,
     JSON.stringify([...emotionalTagSet]),
     estimateTokens(summary),

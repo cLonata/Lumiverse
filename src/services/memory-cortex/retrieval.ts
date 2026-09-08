@@ -13,6 +13,7 @@
  */
 
 import { getDb } from "../../db/connection";
+import { getCanonicalChatChunkRows } from "../chat-chunk-ordering";
 import * as embeddingsSvc from "../embeddings.service";
 import * as entityContext from "./entity-context";
 import * as entityGraph from "./entity-graph";
@@ -362,14 +363,12 @@ function getHighSalienceChunkIds(db: any, chatId: string, limit: number): string
   return rows.map((r) => r.chunk_id);
 }
 
-function getRecentVectorizedChunkIds(db: any, chatId: string, limit: number): string[] {
-  const rows = db
-    .query(
-      `SELECT id FROM chat_chunks
-       WHERE chat_id = ? AND vectorized_at IS NOT NULL
-       ORDER BY created_at DESC LIMIT ?`,
-    )
-    .all(chatId, limit) as Array<{ id: string }>;
+export function getRecentVectorizedChunkIds(_db: any, chatId: string, limit: number): string[] {
+  const rows = getCanonicalChatChunkRows(chatId, {
+    direction: "desc",
+    limit,
+    vectorizedOnly: true,
+  });
   return rows.map((r) => r.id);
 }
 
@@ -721,7 +720,8 @@ export async function queryVaultCortex(
     .slice(0, Math.ceil(topK * 0.5));
   for (const c of highSalience) candidateIds.add(c.id);
 
-  // Final fallback: most recent chunks (source_created_at DESC).
+  // Preserve the existing schema-backed vault behavior. Portable canonical
+  // ordering needs an explicit persisted source-order field in a future patch.
   if (candidateIds.size === 0) {
     const recent = [...chunkRows]
       .sort((a, b) => b.source_created_at - a.source_created_at)

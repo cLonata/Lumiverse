@@ -16,6 +16,7 @@
  */
 
 import { getDb } from "../../db/connection";
+import { loadChatChunkTopology } from "../chat-chunk-ordering";
 import {
   getCortexConfig,
   isCortexEnabledForChat,
@@ -1922,15 +1923,22 @@ export async function rebuildCortex(
     `[memory-cortex] ${resumable ? "Warming" : "Rebuilding"} cortex for chat ${chatId} (sidecar: ${sidecarAvailable ? "yes" : "heuristic only"})`,
   );
 
+  const topology = loadChatChunkTopology(chatId);
+  // Cortex rebuild/warmup promises coverage of the whole visible chat, unlike
+  // surgical chunk rebuilds which may safely operate on a valid prefix.
+  if (!topology.valid || !topology.complete) {
+    const reason = topology.valid ? "incomplete chat chunk coverage" : "invalid chat chunk topology";
+    throw new Error(
+      `Cannot ${resumable ? "warm" : "rebuild"} Memory Cortex for chat ${chatId}: ${reason}; rebuild chat memory first`,
+    );
+  }
   let completedBeforeStart = 0;
   let totalChunks = 0;
   let chunks: any[] = [];
 
   if (!resumable) {
     clearDerivedCortexData(chatId);
-    chunks = db
-      .query("SELECT * FROM chat_chunks WHERE chat_id = ? ORDER BY created_at ASC")
-      .all(chatId) as any[];
+    chunks = topology.chunks;
     totalChunks = chunks.length;
   } else {
     const coverage = getCortexWarmupCoverage(chatId, warmupSignature);
@@ -1941,16 +1949,10 @@ export async function rebuildCortex(
       // invalidated by an appended message, completedChunks can drop to zero;
       // keep existing salience visible until replacement scores are upserted.
       clearDerivedCortexData(chatId, { preserveSalience: true });
-      chunks = db
-        .query("SELECT * FROM chat_chunks WHERE chat_id = ? ORDER BY created_at ASC")
-        .all(chatId) as any[];
+      chunks = topology.chunks;
     } else {
       completedBeforeStart = coverage.completedChunks;
-      chunks = db
-        .query(
-          "SELECT * FROM chat_chunks WHERE chat_id = ? AND (cortex_warmup_signature IS NULL OR cortex_warmup_signature != ?) ORDER BY created_at ASC",
-        )
-        .all(chatId, warmupSignature) as any[];
+      chunks = topology.chunks.filter(chunk => chunk.cortex_warmup_signature !== warmupSignature);
     }
   }
 

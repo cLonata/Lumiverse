@@ -1,4 +1,5 @@
 import { getDb } from "../db/connection";
+import { getCanonicalChatChunkRows } from "./chat-chunk-ordering";
 import * as embeddingsSvc from "./embeddings.service";
 import { type SanitizeOptions } from "../utils/content-sanitizer";
 import { getReasoningStripOptions } from "../utils/reasoning-strip";
@@ -203,7 +204,7 @@ function getVisibleMessageCount(messages: MemoryMessageView[]): number {
   return messages.filter(m => !(m.extra?.hidden) && m.content.trim().length > 0).length;
 }
 
-function getRecentFallbackChunks(
+export function getRecentFallbackChunks(
   chatId: string,
   limit: number,
   excludeMessageIds?: Set<string>,
@@ -212,14 +213,10 @@ function getRecentFallbackChunks(
   // window) and still return up to `limit` genuinely older chunks.
   const hasExclusions = !!excludeMessageIds && excludeMessageIds.size > 0;
   const fetchLimit = hasExclusions ? limit + Math.min(excludeMessageIds!.size, 50) : limit;
-  const rows = getDb()
-    .query(
-      `SELECT id, content, message_ids FROM chat_chunks
-       WHERE chat_id = ?
-       ORDER BY created_at DESC
-       LIMIT ?`,
-    )
-    .all(chatId, fetchLimit) as Array<{ id: string; content: string; message_ids: string | null }>;
+  const rows = getCanonicalChatChunkRows(chatId, {
+    direction: "desc",
+    limit: fetchLimit,
+  }) as Array<{ id: string; content: string; message_ids: string | null }>;
 
   const out: Array<{ content: string; score: number | null; metadata: any }> = [];
   for (const row of rows) {

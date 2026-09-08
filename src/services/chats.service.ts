@@ -29,6 +29,11 @@ import { resolvePersonaOrDefault } from "./personas.service";
 import { resolvePersonaForChatMacros } from "./persona-addon-states";
 import { resolveAndSanitizeForVectorization, contentHasMacroHints } from "./vectorization-content.service";
 import {
+  getCanonicalChatChunkRows,
+  getLastCanonicalChatChunkRow,
+  validateChatChunkTopology,
+} from "./chat-chunk-ordering";
+import {
   AVATAR_BINDING_PRIMARY,
   AVATAR_BINDING_FIELDS,
   findAvatarForFieldBinding,
@@ -3574,25 +3579,38 @@ function rowToChatChunk(row: any): ChatChunk {
 /**
  * Get the last chunk for a chat, or null if no chunks exist.
  */
-function getLastChatChunk(chatId: string): ChatChunk | null {
-  const row = getDb()
-    .query("SELECT * FROM chat_chunks WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1")
-    .get(chatId) as any;
+export function getLastChatChunk(userId: string, chatId: string): ChatChunk | null {
+  if (!getChat(userId, chatId)) return null;
+  const row = getLastCanonicalChatChunkRow(chatId);
   return row ? rowToChatChunk(row) : null;
 }
 
 /**
- * Get all chunks for a chat.
+ * Order raw chunk rows by their earliest contained visible message, never time.
+ * Invalid/orphan rows remain inspectable (unpositioned rows sort last, IDs break
+ * ambiguous ties only), but must never be used to preserve a rebuild prefix.
+ * A valid topology covers a prefix of visible messages; an unchunked tail is OK.
  */
+export function getChatChunkTopology(userId: string, chatId: string) {
+  if (!getChat(userId, chatId)) {
+    return {
+      chunks: [] as any[],
+      messages: [] as Message[],
+      valid: false,
+      complete: false,
+      coveredMessageCount: 0,
+      visibleMessageCount: 0,
+    };
+  }
+  const messages = getMessages(userId, chatId).filter(m => m.extra?.hidden !== true);
+  const topology = validateChatChunkTopology(getCanonicalChatChunkRows(chatId), messages);
+  return { ...topology, messages };
+}
+
+/** Get all chunks in canonical visible-message order. */
 export function getChatChunks(userId: string, chatId: string): ChatChunk[] {
-  const chat = getChat(userId, chatId);
-  if (!chat) return [];
-
-  const rows = getDb()
-    .query("SELECT * FROM chat_chunks WHERE chat_id = ? ORDER BY created_at ASC")
-    .all(chatId) as any[];
-
-  return rows.map(rowToChatChunk);
+  if (!getChat(userId, chatId)) return [];
+  return getCanonicalChatChunkRows(chatId).map(rowToChatChunk);
 }
 
 /**
@@ -3752,22 +3770,23 @@ type SalienceSnapshotRow = {
   created_at: number;
 };
 
-function snapshotSalienceByChunkContent(chatId: string): Map<string, SalienceSnapshotRow[]> {
+function snapshotSalienceByChunkContent(userId: string, chatId: string): Map<string, SalienceSnapshotRow[]> {
   const rows = getDb().query(
-    `SELECT cc.content,
+    `SELECT cc.id AS chunk_id, cc.content,
             ms.score, ms.score_source, ms.emotional_tags, ms.status_changes,
             ms.narrative_flags, ms.has_dialogue, ms.has_action,
             ms.has_internal_thought, ms.word_count, ms.scored_at,
             ms.scored_by, ms.created_at
      FROM memory_salience ms
      JOIN chat_chunks cc ON cc.id = ms.chunk_id
-     WHERE ms.chat_id = ?
-     ORDER BY cc.created_at ASC`,
-  ).all(chatId) as Array<SalienceSnapshotRow & { content: string }>;
+     WHERE ms.chat_id = ?`,
+  ).all(chatId) as Array<SalienceSnapshotRow & { chunk_id: string; content: string }>;
 
+  const order = new Map(getChatChunkTopology(userId, chatId).chunks.map((chunk, i) => [chunk.id, i]));
+  rows.sort((a, b) => order.get(a.chunk_id)! - order.get(b.chunk_id)!);
   const byContent = new Map<string, SalienceSnapshotRow[]>();
   for (const row of rows) {
-    const { content, ...salience } = row;
+    const { chunk_id, content, ...salience } = row;
     const bucket = byContent.get(content);
     if (bucket) bucket.push(salience);
     else byContent.set(content, [salience]);
@@ -3852,7 +3871,7 @@ async function updateChatChunks(userId: string, chatId: string, newMessage: Mess
   const reasoningStrip = getReasoningStripOptions(userId);
   const env = contentHasMacroHints(memStripped) ? buildMacroEnvForChat(userId, chatId) : null;
   const sanitizedContent = await resolveAndSanitizeForVectorization(memStripped, env, reasoningStrip);
-  const lastChunk = getLastChatChunk(chatId);
+  const lastChunk = getLastChatChunk(userId, chatId);
   let chunkId: string;
 
   if (!lastChunk || (await shouldStartNewChunk(lastChunk, newMessage, userId))) {
@@ -4072,40 +4091,36 @@ export async function ensureChatMemoryFresh(userId: string, chatId: string): Pro
  * because they were hidden before chunks were built or the chat has no
  * chunks yet. Callers should fall back to a full rebuild in that case.
  */
-function findAnchorChunkForMessages(chatId: string, messageIds: Iterable<string>): string | null {
+function findAnchorChunkForMessages(userId: string, chatId: string, messageIds: Iterable<string>): string | null {
   const idSet = new Set(messageIds);
   if (idSet.size === 0) return null;
-  const rows = getDb()
-    .query("SELECT id, message_ids FROM chat_chunks WHERE chat_id = ? ORDER BY created_at ASC")
-    .all(chatId) as Array<{ id: string; message_ids: string }>;
-  for (const row of rows) {
-    let parsed: string[];
-    try { parsed = JSON.parse(row.message_ids); } catch { continue; }
-    for (const mid of parsed) {
-      if (idSet.has(mid)) return row.id;
-    }
+  const { chunks, valid } = getChatChunkTopology(userId, chatId);
+  if (!valid) return null;
+  for (const row of chunks) {
+    if ((JSON.parse(row.message_ids) as string[]).some(id => idSet.has(id))) return row.id;
   }
   return null;
 }
 
-function snapshotSalienceForChunks(chatId: string, chunkIds: string[]): Map<string, SalienceSnapshotRow[]> {
+function snapshotSalienceForChunks(userId: string, chatId: string, chunkIds: string[]): Map<string, SalienceSnapshotRow[]> {
   if (chunkIds.length === 0) return new Map();
   const placeholders = chunkIds.map(() => "?").join(",");
   const rows = getDb().query(
-    `SELECT cc.content,
+    `SELECT cc.id AS chunk_id, cc.content,
             ms.score, ms.score_source, ms.emotional_tags, ms.status_changes,
             ms.narrative_flags, ms.has_dialogue, ms.has_action,
             ms.has_internal_thought, ms.word_count, ms.scored_at,
             ms.scored_by, ms.created_at
      FROM memory_salience ms
      JOIN chat_chunks cc ON cc.id = ms.chunk_id
-     WHERE ms.chat_id = ? AND cc.id IN (${placeholders})
-     ORDER BY cc.created_at ASC`,
-  ).all(chatId, ...chunkIds) as Array<SalienceSnapshotRow & { content: string }>;
+     WHERE ms.chat_id = ? AND cc.id IN (${placeholders})`,
+  ).all(chatId, ...chunkIds) as Array<SalienceSnapshotRow & { chunk_id: string; content: string }>;
 
+  const order = new Map(getChatChunkTopology(userId, chatId).chunks.map((chunk, i) => [chunk.id, i]));
+  rows.sort((a, b) => order.get(a.chunk_id)! - order.get(b.chunk_id)!);
   const byContent = new Map<string, SalienceSnapshotRow[]>();
   for (const row of rows) {
-    const { content, ...salience } = row;
+    const { chunk_id, content, ...salience } = row;
     const bucket = byContent.get(content);
     if (bucket) bucket.push(salience);
     else byContent.set(content, [salience]);
@@ -4176,7 +4191,7 @@ export async function rebuildChatChunksFromMessages(
   chatId: string,
   affectedMessageIds: Iterable<string>,
 ): Promise<void> {
-  const anchorChunkId = findAnchorChunkForMessages(chatId, affectedMessageIds);
+  const anchorChunkId = findAnchorChunkForMessages(userId, chatId, affectedMessageIds);
   if (anchorChunkId === null) {
     return rebuildChatChunks(userId, chatId);
   }
@@ -4236,7 +4251,7 @@ async function _rebuildChatChunksBody(userId: string, chatId: string): Promise<v
     return;
   }
 
-  const salienceByContent = snapshotSalienceByChunkContent(chatId);
+  const salienceByContent = snapshotSalienceByChunkContent(userId, chatId);
   getDb().query("DELETE FROM chat_chunks WHERE chat_id = ?").run(chatId);
 
   const chatMemSettings = embeddingsSvc.resolveEffectiveChatMemorySettings(
@@ -4355,7 +4370,7 @@ async function chunkAndPersistMessages(
  * chunk. Preserved chunks keep their cortex_warmup_signature so the Memory
  * Cortex coverage check skips them on the next warmup. Falls back to a full
  * rebuild whenever the inputs make a surgical pass unsafe (anchor missing,
- * anchor is chunk 0, preserved chunk's tail message has been deleted).
+ * anchor is chunk 0, or the visible-message partition is invalid).
  */
 async function _rebuildChatChunksFromImpl(userId: string, chatId: string, fromChunkId: string): Promise<void> {
   await enqueueChatPipelineTask({
@@ -4376,9 +4391,11 @@ async function _rebuildChatChunksFromBody(userId: string, chatId: string, fromCh
     return _rebuildChatChunksBody(userId, chatId);
   }
 
-  const allChunks = getDb()
-    .query("SELECT * FROM chat_chunks WHERE chat_id = ? ORDER BY created_at ASC")
-    .all(chatId) as Array<{ id: string; end_message_id: string; created_at: number }>;
+  const { chunks: allChunks, messages: allMessages, valid } = getChatChunkTopology(userId, chatId);
+  if (!valid) {
+    // Validate the entire graph at execution, including the would-be prefix.
+    return _rebuildChatChunksBody(userId, chatId);
+  }
   const fromIdx = allChunks.findIndex((c) => c.id === fromChunkId);
 
   if (fromIdx <= 0) {
@@ -4390,7 +4407,6 @@ async function _rebuildChatChunksFromBody(userId: string, chatId: string, fromCh
   const lastPreserved = allChunks[fromIdx - 1];
   const discardedChunkIds = allChunks.slice(fromIdx).map((c) => c.id);
 
-  const allMessages = getMessages(userId, chatId).filter((m) => m.extra?.hidden !== true);
   const preservedEndIdx = allMessages.findIndex((m) => m.id === lastPreserved.end_message_id);
   if (preservedEndIdx < 0) {
     // The last preserved chunk's tail message was deleted; the surgical
@@ -4399,7 +4415,7 @@ async function _rebuildChatChunksFromBody(userId: string, chatId: string, fromCh
   }
   const messagesToChunk = allMessages.slice(preservedEndIdx + 1);
 
-  const salienceByContent = snapshotSalienceForChunks(chatId, discardedChunkIds);
+  const salienceByContent = snapshotSalienceForChunks(userId, chatId, discardedChunkIds);
 
   try {
     await embeddingsSvc.deleteChatChunkEmbeddings(userId, chatId, discardedChunkIds);

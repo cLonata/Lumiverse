@@ -9,6 +9,7 @@
  */
 
 import { getDb } from "../../db/connection";
+import { loadChatChunkTopology } from "../chat-chunk-ordering";
 import * as embeddingsSvc from "../embeddings.service";
 import type {
   EntityType,
@@ -343,6 +344,14 @@ function snapshotVaultContents(
   options?: { replaceExisting?: boolean },
 ): { entityCount: number; relationCount: number; chunkIdMap: Map<string, string> } {
   const db = getDb();
+  const topology = loadChatChunkTopology(chatId);
+  // A portable snapshot must not silently omit an unchunked visible suffix.
+  if (!topology.valid || !topology.complete) {
+    const reason = topology.valid ? "incomplete chat chunk coverage" : "invalid chat chunk topology";
+    throw new Error(
+      `Cannot snapshot Memory Cortex vault for chat ${chatId}: ${reason}; rebuild chat memory first`,
+    );
+  }
 
   return db.transaction(() => {
     if (name !== null && !options?.replaceExisting) {
@@ -417,17 +426,23 @@ function snapshotVaultContents(
     // Copy vectorized chunks as vault chunks. Only chunks that are actually
     // vectorized (vectorized_at IS NOT NULL) get copied — non-vectorized
     // chunks have no LanceDB row to clone, so they'd be unsearchable anyway.
-    const chunkRows = db.query(
-      `SELECT cc.id, cc.content, cc.entity_ids, cc.created_at,
-              ms.score AS salience_score, ms.emotional_tags AS emotional_tags
-       FROM chat_chunks cc
-       LEFT JOIN memory_salience ms ON ms.chunk_id = cc.id
-       WHERE cc.chat_id = ? AND cc.vectorized_at IS NOT NULL
-       ORDER BY cc.created_at ASC`,
-    ).all(chatId) as Array<{
-      id: string; content: string; entity_ids: string | null; created_at: number;
-      salience_score: number | null; emotional_tags: string | null;
+    // Topology validation above prevents copying corrupt or incomplete source
+    // history. No portable canonical ordinal is persisted by the current schema.
+    const canonicalChunks = topology.chunks.filter(chunk => chunk.vectorized_at != null);
+    const chunkIds = canonicalChunks.map(chunk => chunk.id);
+    const placeholders = chunkIds.map(() => "?").join(",");
+    const salienceRows = chunkIds.length === 0 ? [] : db.query(
+      `SELECT chunk_id, score, emotional_tags FROM memory_salience
+       WHERE chunk_id IN (${placeholders})`,
+    ).all(...chunkIds) as Array<{
+      chunk_id: string; score: number | null; emotional_tags: string | null;
     }>;
+    const salienceByChunk = new Map(salienceRows.map(row => [row.chunk_id, row]));
+    const chunkRows = canonicalChunks.map(chunk => ({
+      ...chunk,
+      salience_score: salienceByChunk.get(chunk.id)?.score ?? null,
+      emotional_tags: salienceByChunk.get(chunk.id)?.emotional_tags ?? null,
+    }));
 
     const insertChunk = db.query(
       `INSERT INTO cortex_vault_chunks
