@@ -4128,49 +4128,153 @@ function snapshotSalienceForChunks(userId: string, chatId: string, chunkIds: str
   return byContent;
 }
 
+interface RebuildIntent {
+  full: boolean;
+  affectedMessageIds: Set<string>;
+}
+
+interface ChatRebuildState {
+  userId: string;
+  chatId: string;
+  pending: RebuildIntent | null;
+  done: Promise<void>;
+  resolveDone: () => void;
+  rejectDone: (reason?: unknown) => void;
+}
+
 /**
- * In-flight rebuild tracking per chat — prevents concurrent rebuilds from
- * racing each other (each deleting the previous one's chunks). When a
- * rebuild is already running for a chatId, subsequent calls wait for it
- * and then trigger one more rebuild to capture any changes that landed
- * during the first rebuild.
+ * One owner per chat drains rebuild intent through the shared pipeline lane.
+ * The map covers the complete queued/executing drain. An intent is removed
+ * from `pending` before it starts, so mutations arriving during that pass are
+ * retained as the next generation rather than being silently subsumed.
  */
-const _rebuildInflight = new Map<string, Promise<void>>();
-const _rebuildPending = new Set<string>();
+const _rebuildStates = new Map<string, ChatRebuildState>();
 
 export function isChatChunkRebuildInProgress(chatId: string): boolean {
-  return _rebuildInflight.has(chatId);
+  return _rebuildStates.has(chatId);
+}
+
+function mergeRebuildIntent(pending: RebuildIntent | null, incoming: RebuildIntent): RebuildIntent {
+  // Empty surgical scope has always meant "no safe anchor", hence full. Keep
+  // that invariant defensive here as well as at the public API boundary.
+  if (!incoming.full && incoming.affectedMessageIds.size === 0) {
+    incoming = { full: true, affectedMessageIds: new Set() };
+  }
+  if (pending && !pending.full && pending.affectedMessageIds.size === 0) {
+    pending = { full: true, affectedMessageIds: new Set() };
+  }
+  if (!pending) return incoming;
+  if (pending.full) return pending;
+  if (incoming.full) return { full: true, affectedMessageIds: new Set() };
+  for (const messageId of incoming.affectedMessageIds) pending.affectedMessageIds.add(messageId);
+  return pending;
+}
+
+function enqueueChatChunkRebuildIntent(
+  userId: string,
+  chatId: string,
+  intent: RebuildIntent,
+): Promise<void> {
+  const existing = _rebuildStates.get(chatId);
+  if (existing) {
+    if (existing.userId !== userId) {
+      return Promise.reject(new Error(`Chat rebuild ${chatId} is already owned by another user`));
+    }
+    existing.pending = mergeRebuildIntent(existing.pending, intent);
+    return existing.done;
+  }
+
+  let resolveDone!: () => void;
+  let rejectDone!: (reason?: unknown) => void;
+  const done = new Promise<void>((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
+  });
+  const state: ChatRebuildState = {
+    userId,
+    chatId,
+    pending: intent,
+    done,
+    resolveDone,
+    rejectDone,
+  };
+
+  // Install synchronously before starting the async owner. This closes the
+  // synchronous-start window where a second request could create another owner.
+  _rebuildStates.set(chatId, state);
+  void drainChatChunkRebuildState(state);
+  return done;
+}
+
+async function drainChatChunkRebuildState(state: ChatRebuildState): Promise<void> {
+  try {
+    while (true) {
+      const intent = state.pending;
+      if (intent === null) {
+        // No await may occur between observing quiescence and removing the
+        // owner. A later request will install a fresh state.
+        if (_rebuildStates.get(state.chatId) === state) {
+          _rebuildStates.delete(state.chatId);
+        }
+        state.resolveDone();
+        return;
+      }
+
+      // New requests now accumulate independently as the next generation.
+      state.pending = null;
+      await executeChatChunkRebuildIntent(state.userId, state.chatId, intent);
+    }
+  } catch (err) {
+    state.pending = null;
+    if (_rebuildStates.get(state.chatId) === state) {
+      _rebuildStates.delete(state.chatId);
+    }
+    state.rejectDone(err);
+  }
+}
+
+async function executeChatChunkRebuildIntent(
+  userId: string,
+  chatId: string,
+  intent: RebuildIntent,
+): Promise<void> {
+  await enqueueChatPipelineTask({
+    chatId,
+    kind: "chunk_rebuild",
+    exclusive: true,
+    run: async () => {
+      if (intent.full) {
+        return _rebuildChatChunksBody(userId, chatId);
+      }
+
+      // Resolve only after this generation owns the pipeline lane. Any chunk
+      // IDs replaced by an earlier generation are therefore never reused.
+      const anchorChunkId = findAnchorChunkForMessages(
+        userId,
+        chatId,
+        intent.affectedMessageIds,
+      );
+      if (anchorChunkId === null) {
+        return _rebuildChatChunksBody(userId, chatId);
+      }
+      return _rebuildChatChunksFromBody(userId, chatId, anchorChunkId);
+    },
+  });
 }
 
 /**
  * Rebuild all chunks for a chat from scratch.
  * Used for migration or when chunk structure needs to be reset.
  *
- * Concurrent calls for the same chat are coalesced: the first runs
- * immediately, subsequent callers wait for it and then a single follow-up
- * rebuild runs to capture any changes that landed during the first.
+ * Concurrent calls enter the same per-chat drain. A full intent that remains
+ * pending dominates surgical work in that generation; mutations arriving
+ * after it is claimed are retained for a later generation.
  */
 export async function rebuildChatChunks(userId: string, chatId: string): Promise<void> {
-  const inflight = _rebuildInflight.get(chatId);
-  if (inflight) {
-    // Another rebuild is already running — mark pending and wait for it
-    _rebuildPending.add(chatId);
-    await inflight;
-    // If we're the one to run the follow-up, do it; otherwise another
-    // caller already picked it up.
-    if (!_rebuildPending.has(chatId)) return;
-    _rebuildPending.delete(chatId);
-  }
-
-  const promise = _rebuildChatChunksImpl(userId, chatId);
-  _rebuildInflight.set(chatId, promise);
-  try {
-    await promise;
-  } finally {
-    if (_rebuildInflight.get(chatId) === promise) {
-      _rebuildInflight.delete(chatId);
-    }
-  }
+  return enqueueChatChunkRebuildIntent(userId, chatId, {
+    full: true,
+    affectedMessageIds: new Set(),
+  });
 }
 
 /**
@@ -4179,52 +4283,24 @@ export async function rebuildChatChunks(userId: string, chatId: string): Promise
  * cortex_warmup_signature and salience), so a message edit no longer cascades
  * into a full-chat cortex rebuild.
  *
- * Falls back to a full rebuild when:
- *   - No chunk contains any of the affected message IDs (e.g., the message
- *     was hidden, the chat has no chunks yet).
- *   - A rebuild is already in flight (the follow-up runs as a full rebuild
- *     because we can't know which scope covers the work that landed during
- *     the wait).
+ * Overlapping requests retain and merge their affected message IDs. Each
+ * generation resolves its anchor against the current canonical chunk graph
+ * only after it owns the pipeline lane. Unsafe topology/anchor states still
+ * fall back to the private full rebuild body.
  */
 export async function rebuildChatChunksFromMessages(
   userId: string,
   chatId: string,
   affectedMessageIds: Iterable<string>,
 ): Promise<void> {
-  const anchorChunkId = findAnchorChunkForMessages(userId, chatId, affectedMessageIds);
-  if (anchorChunkId === null) {
-    return rebuildChatChunks(userId, chatId);
-  }
-
-  const inflight = _rebuildInflight.get(chatId);
-  if (inflight) {
-    _rebuildPending.add(chatId);
-    await inflight;
-    if (!_rebuildPending.has(chatId)) return;
-    _rebuildPending.delete(chatId);
-    // Conservative follow-up: the in-flight rebuild may have already replaced
-    // the chunk graph, so the anchor we picked could be stale. A full rebuild
-    // is correct under any state.
-    return rebuildChatChunks(userId, chatId);
-  }
-
-  const promise = _rebuildChatChunksFromImpl(userId, chatId, anchorChunkId);
-  _rebuildInflight.set(chatId, promise);
-  try {
-    await promise;
-  } finally {
-    if (_rebuildInflight.get(chatId) === promise) {
-      _rebuildInflight.delete(chatId);
-    }
-  }
-}
-
-async function _rebuildChatChunksImpl(userId: string, chatId: string): Promise<void> {
-  await enqueueChatPipelineTask({
-    chatId,
-    kind: "chunk_rebuild",
-    exclusive: true,
-    run: () => _rebuildChatChunksBody(userId, chatId),
+  // Materialize immediately: callers may supply one-shot or mutable iterables.
+  const messageIds = new Set(affectedMessageIds);
+  return enqueueChatChunkRebuildIntent(userId, chatId, {
+    // Empty input has historically required the safe full-rebuild path. Make
+    // that intent explicit before merging so a later surgical request cannot
+    // weaken it by adding IDs to an otherwise-empty pending generation.
+    full: messageIds.size === 0,
+    affectedMessageIds: messageIds,
   });
 }
 
@@ -4372,15 +4448,6 @@ async function chunkAndPersistMessages(
  * rebuild whenever the inputs make a surgical pass unsafe (anchor missing,
  * anchor is chunk 0, or the visible-message partition is invalid).
  */
-async function _rebuildChatChunksFromImpl(userId: string, chatId: string, fromChunkId: string): Promise<void> {
-  await enqueueChatPipelineTask({
-    chatId,
-    kind: "chunk_rebuild",
-    exclusive: true,
-    run: () => _rebuildChatChunksFromBody(userId, chatId, fromChunkId),
-  });
-}
-
 async function _rebuildChatChunksFromBody(userId: string, chatId: string, fromChunkId: string): Promise<void> {
   invalidateChatMemoryCache(chatId);
 

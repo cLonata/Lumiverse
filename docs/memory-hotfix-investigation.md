@@ -1,7 +1,7 @@
 # Memory/LTM/Cortex Hotfix Investigation
 
 **Branch:** `test/memory-hotfix`  
-**Status:** Patch A is implemented and regression-tested. Bugs B/C remain proposed and unchanged. No production deployment is claimed.
+**Status:** Patches A and B are implemented and regression-tested. Bug C remains proposed and unfixed. No production deployment is claimed.
 **Evidence convention:** **[Code]** is directly established by the checked-out source. **[Production]** is a value or event reported from the real incident's logs/database evidence. **[Inference]** is an engineering conclusion consistent with the first two, but not independently proven by them. **[Open]** is not yet established.
 
 ## Executive Summary
@@ -116,6 +116,24 @@ The `getChatChunks()` API and Cortex rebuild queries use the same timestamp orde
 - Explicitly decide and test fallback ordering for legacy/orphan chunks rather than silently relying on `created_at`.
 
 ## Bug B: Rebuild Coalescing / Full-Rebuild Escalation
+
+### Patch B implementation status
+
+Patch B replaces the boolean-like `_rebuildInflight` / `_rebuildPending` pairing with one per-chat owner state containing a shared completion promise and a pending `RebuildIntent`. Surgical intents union their materialized affected-message ID sets. Empty affected-message input is normalized to explicit full intent before coalescing, so a later surgical merge cannot weaken its existing safe full-rebuild semantics. A pending explicit-full intent dominates surgical intent, while a surgical request arriving after a full generation has been claimed is retained for the next generation. **[Implemented and regression-tested]**
+
+The owner atomically claims and clears one pending generation, submits one exclusive `chunk_rebuild`, and drains any intent accumulated during execution as a later generation. Surgical anchors are resolved inside the pipeline task's `run` callback against Patch A's current canonical topology; the surgical body retains its independent execution-time topology validation. Safety fallbacks call the private full rebuild body directly and do not re-enter the public coalescer. Owner installation is synchronous, quiescent removal occurs without an intervening await, and rejection centrally removes both the owner and pending intent before rejecting the shared promise. **[Implemented and regression-tested]**
+
+Dedicated regression coverage was added in `tests/chat-chunk-rebuild-coalescing.test.ts` for two and many overlapping surgical requests, replacement chunk IDs, queued overlap, pending-full dominance, surgical work arriving during an executing full rebuild, invalid follow-up topology, shared completion, failure cleanup, and empty affected-message input. Patch A's completed validation record is unchanged. Bug C's queued-versus-running semantics and `chat-pipeline-coordinator` remain unchanged. **[Implemented and regression-tested]**
+
+### Patch B validation results
+
+| Selection | Result | Assertions | Files |
+| --- | --- | ---: | ---: |
+| Dedicated Patch B coalescing suite (`tests/chat-chunk-rebuild-coalescing.test.ts`) | 12 pass / 0 fail | 37 | 1 |
+| Patch A + Patch B interaction set | 37 pass / 0 fail | 129 | 4 |
+| Broader memory/chat regression selection | 146 pass / 0 fail | 455 | 20 |
+
+The broader `chats.service` selection emitted the already-known, caught asynchronous reduced-fixture errors about missing `settings` and `chat_chunks` tables. They did not fail any tests and are not classified as Patch B regressions. Production deployment is not claimed. Bug C remains unfixed.
 
 ### Root defect
 
