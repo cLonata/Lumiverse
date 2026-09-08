@@ -71,6 +71,7 @@ frontend/.dist-backup-*/
 *.md
 !developer-docs/**/*.md
 !user-docs/**/*.md
+!docs/memory-hotfix-investigation.md
 
 !LICENSE.md
 !README.md
