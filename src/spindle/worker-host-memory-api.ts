@@ -931,7 +931,7 @@ export class WorkerHostMemoryApi {
         }
 
         if (force) {
-          await chatsSvc.rebuildChatChunks(resolvedUserId, chatId);
+          await chatsSvc.rebuildChatChunks(resolvedUserId, chatId, "manual");
           this.postToWorker({
             type: "response",
             requestId,

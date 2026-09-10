@@ -450,7 +450,7 @@ async function warmLongTermChatMemory(options: {
   }
 
   if (force) {
-    await chatsSvc.rebuildChatChunks(userId, chatId);
+    await chatsSvc.rebuildChatChunks(userId, chatId, "manual");
     return { status: "complete", reason: "chat_memory_rebuilt" };
   }
 

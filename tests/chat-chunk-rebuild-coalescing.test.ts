@@ -370,4 +370,103 @@ describe("chat chunk rebuild intent coalescing", () => {
     await owner;
     expect(chunkIds().slice(0, 5)).toEqual(["c0", "c1", "c2", "c3", "c4"]);
   });
+
+  test("surgical request intent retains its provenance", () => {
+    const intent = chatsSvc.createRebuildIntent(false, ["m2"], "message_update");
+
+    expect(intent.full).toBe(false);
+    expect([...intent.affectedMessageIds]).toEqual(["m2"]);
+    expect([...intent.reasons]).toEqual(["message_update"]);
+    expect(intent.traceIds.size).toBe(1);
+  });
+
+  test("full request intent retains its provenance", () => {
+    const intent = chatsSvc.createRebuildIntent(true, [], "manual");
+
+    expect(intent.full).toBe(true);
+    expect(intent.affectedMessageIds.size).toBe(0);
+    expect([...intent.reasons]).toEqual(["manual"]);
+    expect(intent.traceIds.size).toBe(1);
+  });
+
+  test("merging surgical intents retains IDs, reasons, and trace IDs", () => {
+    const first = chatsSvc.createRebuildIntent(false, ["m2"], "message_update");
+    const second = chatsSvc.createRebuildIntent(false, ["m4"], "swipe_change");
+    const merged = chatsSvc.mergeRebuildIntent(first, second, CHAT_ID);
+
+    expect(merged.full).toBe(false);
+    expect([...merged.affectedMessageIds]).toEqual(["m2", "m4"]);
+    expect([...merged.reasons]).toEqual(["message_update", "swipe_change"]);
+    expect(merged.traceIds.size).toBe(2);
+  });
+
+  test("full intent dominates surgical intent while retaining provenance", () => {
+    const surgical = chatsSvc.createRebuildIntent(false, ["m2"], "message_delete");
+    const full = chatsSvc.createRebuildIntent(true, [], "manual");
+    const merged = chatsSvc.mergeRebuildIntent(surgical, full, CHAT_ID);
+
+    expect(merged.full).toBe(true);
+    expect([...merged.affectedMessageIds]).toEqual(["m2"]);
+    expect([...merged.reasons]).toEqual(["message_delete", "manual"]);
+    expect(merged.traceIds.size).toBe(2);
+  });
+
+  test("anchor diagnostics identify a matched message", () => {
+    expect(chatsSvc.findAnchorChunkForMessages(USER_ID, CHAT_ID, ["m2"])).toEqual({
+      anchorChunkId: "c2",
+      reason: "matched",
+      topologyValid: true,
+      totalChunks: 6,
+      matchedMessageIds: ["m2"],
+    });
+  });
+
+  test("anchor diagnostics retain the earliest anchor and all matched IDs", () => {
+    expect(chatsSvc.findAnchorChunkForMessages(USER_ID, CHAT_ID, ["m4", "deleted-m3", "m1"])).toEqual({
+      anchorChunkId: "c1",
+      reason: "matched",
+      topologyValid: true,
+      totalChunks: 6,
+      matchedMessageIds: ["m1", "m4"],
+    });
+  });
+
+  test("anchor diagnostics identify invalid topology", () => {
+    getDb().query("UPDATE chat_chunks SET end_message_id = 'm1' WHERE id = 'c0'").run();
+
+    expect(chatsSvc.findAnchorChunkForMessages(USER_ID, CHAT_ID, ["m2"])).toMatchObject({
+      anchorChunkId: null,
+      reason: "invalid_topology",
+      topologyValid: false,
+      totalChunks: 6,
+      matchedMessageIds: [],
+    });
+  });
+
+  test("anchor diagnostics identify a missing or deleted message ID", () => {
+    expect(chatsSvc.findAnchorChunkForMessages(USER_ID, CHAT_ID, ["deleted-m2"])).toEqual({
+      anchorChunkId: null,
+      reason: "no_matching_message_id",
+      topologyValid: true,
+      totalChunks: 6,
+      matchedMessageIds: [],
+    });
+  });
+
+  test("anchor fallback logs full lifecycle mode separately from the surgical request", async () => {
+    const info = spyOn(console, "info").mockImplementation(() => {});
+    restorables.push(info);
+
+    await chatsSvc.rebuildChatChunksFromMessages(USER_ID, CHAT_ID, ["deleted-m2"], "message_delete");
+
+    const lifecycleEvents = info.mock.calls
+      .map(([message]) => String(message))
+      .filter(message => message.startsWith("[chats:rebuild] full_"))
+      .map(message => JSON.parse(message.slice(message.indexOf("{"))));
+    expect(lifecycleEvents).toHaveLength(2);
+    for (const event of lifecycleEvents) {
+      expect(event.mode).toBe("full");
+      expect(event.requested_mode).toBe("surgical");
+    }
+  });
 });

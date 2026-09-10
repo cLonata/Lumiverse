@@ -2818,7 +2818,7 @@ export function updateMessage(userId: string, id: string, input: UpdateMessageIn
       memoryCortex.invalidateLinkedCortexCache(updated.chat_id);
     } catch { /* ignore if not loaded */ }
 
-    rebuildChatChunksFromMessages(userId, updated.chat_id, [updated.id]).catch(err => {
+    rebuildChatChunksFromMessages(userId, updated.chat_id, [updated.id], "message_update").catch(err => {
       console.warn("[chats] Failed to rebuild chunks after message edit:", err);
     });
   }
@@ -2907,7 +2907,7 @@ export function bulkSetHidden(userId: string, chatId: string, messageIds: string
   // Rebuild chunks once after all updates. Surgical from the earliest affected
   // chunk; if any of the flipped messages were previously hidden (not in any
   // chunk), the surgical path falls back to a full rebuild automatically.
-  rebuildChatChunksFromMessages(userId, chatId, updated.map(m => m.id)).catch(err => {
+  rebuildChatChunksFromMessages(userId, chatId, updated.map(m => m.id), "hidden_change").catch(err => {
     console.warn("[chats] Failed to rebuild chunks after bulk hide:", err);
   });
 
@@ -2965,7 +2965,7 @@ export function bulkDeleteMessages(userId: string, chatId: string, messageIds: s
       memoryCortex.invalidateLinkedCortexCache(chatId);
     } catch { /* ignore if not loaded */ }
 
-    rebuildChatChunksFromMessages(userId, chatId, deletedIds).catch(err => {
+    rebuildChatChunksFromMessages(userId, chatId, deletedIds, "bulk_delete").catch(err => {
       console.warn("[chats] Failed to rebuild chunks after bulk delete:", err);
     });
   }
@@ -2994,14 +2994,14 @@ export function deleteMessage(userId: string, id: string): boolean {
       memoryCortex.invalidateLinkedCortexCache(msg.chat_id);
     } catch { /* ignore if not loaded */ }
 
-    rebuildChatChunksFromMessages(userId, msg.chat_id, [id]).catch(err => {
+    rebuildChatChunksFromMessages(userId, msg.chat_id, [id], "message_delete").catch(err => {
       console.warn("[chats] Failed to rebuild chunks after message delete:", err);
     });
   }
   return result.changes > 0;
 }
 
-function scheduleMemoryRebuildForActiveMessageChange(userId: string, chatId: string, messageId: string, reason: string): void {
+function scheduleMemoryRebuildForActiveMessageChange(userId: string, chatId: string, messageId: string, reason: RebuildReason): void {
   try {
     invalidateChatMemoryCache(chatId);
   } catch { /* test/minimal schemas may omit runtime cache tables */ }
@@ -3015,7 +3015,7 @@ function scheduleMemoryRebuildForActiveMessageChange(userId: string, chatId: str
     .get();
   if (!hasChatChunksTable) return;
 
-  rebuildChatChunksFromMessages(userId, chatId, [messageId]).catch(err => {
+  rebuildChatChunksFromMessages(userId, chatId, [messageId], reason).catch(err => {
     console.warn(`[chats] Failed to rebuild chunks after ${reason}:`, err);
   });
 }
@@ -3060,7 +3060,7 @@ export function addSwipe(userId: string, messageId: string, content: string): Me
     userId,
   );
   if (content !== msg.content) {
-    scheduleMemoryRebuildForActiveMessageChange(userId, updated.chat_id, messageId, "swipe add");
+    scheduleMemoryRebuildForActiveMessageChange(userId, updated.chat_id, messageId, "swipe_change");
   }
   return updated;
 }
@@ -3098,7 +3098,7 @@ export function updateSwipe(userId: string, messageId: string, swipeIdx: number,
   );
 
   if (swipeIdx === msg.swipe_id && content !== msg.content) {
-    scheduleMemoryRebuildForActiveMessageChange(userId, updated.chat_id, messageId, "swipe update");
+    scheduleMemoryRebuildForActiveMessageChange(userId, updated.chat_id, messageId, "swipe_change");
   }
 
   return updated;
@@ -3158,7 +3158,7 @@ export function deleteSwipe(userId: string, messageId: string, swipeIdx: number)
     userId,
   );
   if (newContent !== msg.content) {
-    scheduleMemoryRebuildForActiveMessageChange(userId, updated.chat_id, messageId, "swipe delete");
+    scheduleMemoryRebuildForActiveMessageChange(userId, updated.chat_id, messageId, "swipe_change");
   }
   return updated;
 }
@@ -3195,7 +3195,7 @@ export function cycleSwipe(userId: string, messageId: string, direction: "left" 
     userId,
   );
   if (nextContent !== msg.content) {
-    scheduleMemoryRebuildForActiveMessageChange(userId, updated.chat_id, messageId, "swipe navigation");
+    scheduleMemoryRebuildForActiveMessageChange(userId, updated.chat_id, messageId, "swipe_change");
   }
   return updated;
 }
@@ -4073,7 +4073,7 @@ export async function ensureChatMemoryFresh(userId: string, chatId: string): Pro
 
     // Hash mismatch — chunks are stale. Rebuild.
     console.info(`[chats] LTCM config hash mismatch for chat ${chatId} (stored: ${storedHash ?? "none"}, current: ${currentHash}). Rebuilding chunks.`);
-    await rebuildChatChunks(userId, chatId);
+    await rebuildChatChunks(userId, chatId, "ltcm_config_mismatch");
     return true;
   } catch (err) {
     console.warn("[chats] LTCM freshness check failed:", err);
@@ -4091,15 +4091,42 @@ export async function ensureChatMemoryFresh(userId: string, chatId: string): Pro
  * because they were hidden before chunks were built or the chat has no
  * chunks yet. Callers should fall back to a full rebuild in that case.
  */
-function findAnchorChunkForMessages(userId: string, chatId: string, messageIds: Iterable<string>): string | null {
+export interface AnchorResolution {
+  anchorChunkId: string | null;
+  reason: "matched" | "empty_scope" | "invalid_topology" | "no_matching_message_id";
+  topologyValid: boolean;
+  totalChunks: number;
+  matchedMessageIds: string[];
+}
+
+export function findAnchorChunkForMessages(userId: string, chatId: string, messageIds: Iterable<string>): AnchorResolution {
   const idSet = new Set(messageIds);
-  if (idSet.size === 0) return null;
-  const { chunks, valid } = getChatChunkTopology(userId, chatId);
-  if (!valid) return null;
-  for (const row of chunks) {
-    if ((JSON.parse(row.message_ids) as string[]).some(id => idSet.has(id))) return row.id;
+  if (idSet.size === 0) {
+    return { anchorChunkId: null, reason: "empty_scope", topologyValid: true, totalChunks: 0, matchedMessageIds: [] };
   }
-  return null;
+  const { chunks, valid } = getChatChunkTopology(userId, chatId);
+  if (!valid) {
+    return { anchorChunkId: null, reason: "invalid_topology", topologyValid: false, totalChunks: chunks.length, matchedMessageIds: [] };
+  }
+  let anchorChunkId: string | null = null;
+  const matchedMessageIds = new Set<string>();
+  for (const row of chunks) {
+    const matches = (JSON.parse(row.message_ids) as string[]).filter(id => idSet.has(id));
+    if (matches.length > 0) {
+      if (anchorChunkId === null) anchorChunkId = row.id;
+      for (const id of matches) matchedMessageIds.add(id);
+    }
+  }
+  if (anchorChunkId !== null) {
+    return {
+      anchorChunkId,
+      reason: "matched",
+      topologyValid: true,
+      totalChunks: chunks.length,
+      matchedMessageIds: [...matchedMessageIds],
+    };
+  }
+  return { anchorChunkId: null, reason: "no_matching_message_id", topologyValid: true, totalChunks: chunks.length, matchedMessageIds: [] };
 }
 
 function snapshotSalienceForChunks(userId: string, chatId: string, chunkIds: string[]): Map<string, SalienceSnapshotRow[]> {
@@ -4128,9 +4155,79 @@ function snapshotSalienceForChunks(userId: string, chatId: string, chunkIds: str
   return byContent;
 }
 
-interface RebuildIntent {
+export type RebuildReason =
+  | "message_delete"
+  | "bulk_delete"
+  | "message_update"
+  | "swipe_change"
+  | "hidden_change"
+  | "ltcm_config_mismatch"
+  | "manual"
+  | "migration"
+  | "unknown";
+
+export interface RebuildIntent {
   full: boolean;
   affectedMessageIds: Set<string>;
+  reasons: Set<RebuildReason>;
+  traceIds: Set<string>;
+}
+
+let rebuildTraceSequence = 0;
+
+function nextRebuildTraceId(): string {
+  rebuildTraceSequence = (rebuildTraceSequence + 1) % 1_000_000;
+  return `${Date.now().toString(36)}-${rebuildTraceSequence.toString(36)}`;
+}
+
+export function createRebuildIntent(full: boolean, affectedMessageIds: Iterable<string>, reason: RebuildReason = "unknown"): RebuildIntent {
+  return {
+    full,
+    affectedMessageIds: new Set(affectedMessageIds),
+    reasons: new Set([reason]),
+    traceIds: new Set([nextRebuildTraceId()]),
+  };
+}
+
+function shortId(id: string): string {
+  return id.length <= 12 ? id : `${id.slice(0, 8)}…${id.slice(-4)}`;
+}
+
+function intentLogData(intent: RebuildIntent): Record<string, unknown> {
+  return {
+    mode: intent.full ? "full" : "surgical",
+    trace_ids: [...intent.traceIds],
+    reasons: [...intent.reasons],
+    affected_count: intent.affectedMessageIds.size,
+    affected_ids: [...intent.affectedMessageIds].map(shortId),
+  };
+}
+
+function logRebuild(stage: string, data: Record<string, unknown>, level: "info" | "warn" = "info"): void {
+  console[level](`[chats:rebuild] ${stage} ${JSON.stringify(data)}`);
+}
+
+const _chatChunkWarmupSignatureSupport = new WeakMap<object, boolean>();
+
+function getChatChunkRebuildCounts(chatId: string): { total: number; signed: number; unsigned: number } {
+  const db = getDb();
+  let hasWarmupSignature = _chatChunkWarmupSignatureSupport.get(db);
+  if (hasWarmupSignature === undefined) {
+    hasWarmupSignature = (db.query("PRAGMA table_info(chat_chunks)").all() as Array<{ name: string }>)
+      .some(column => column.name === "cortex_warmup_signature");
+    _chatChunkWarmupSignatureSupport.set(db, hasWarmupSignature);
+  }
+  if (!hasWarmupSignature) {
+    const row = db.query("SELECT COUNT(*) AS total FROM chat_chunks WHERE chat_id = ?").get(chatId) as { total: number };
+    return { total: row.total, signed: 0, unsigned: 0 };
+  }
+  const row = db.query(
+    `SELECT COUNT(*) AS total,
+            COALESCE(SUM(CASE WHEN cortex_warmup_signature IS NOT NULL THEN 1 ELSE 0 END), 0) AS signed,
+            COALESCE(SUM(CASE WHEN cortex_warmup_signature IS NULL THEN 1 ELSE 0 END), 0) AS unsigned
+     FROM chat_chunks WHERE chat_id = ?`,
+  ).get(chatId) as { total: number; signed: number; unsigned: number };
+  return row;
 }
 
 interface ChatRebuildState {
@@ -4154,20 +4251,50 @@ export function isChatChunkRebuildInProgress(chatId: string): boolean {
   return _rebuildStates.has(chatId);
 }
 
-function mergeRebuildIntent(pending: RebuildIntent | null, incoming: RebuildIntent): RebuildIntent {
+export function mergeRebuildIntent(pending: RebuildIntent | null, incoming: RebuildIntent, chatId?: string): RebuildIntent {
   // Empty surgical scope has always meant "no safe anchor", hence full. Keep
   // that invariant defensive here as well as at the public API boundary.
   if (!incoming.full && incoming.affectedMessageIds.size === 0) {
-    incoming = { full: true, affectedMessageIds: new Set() };
+    incoming = { ...incoming, full: true, affectedMessageIds: new Set() };
   }
   if (pending && !pending.full && pending.affectedMessageIds.size === 0) {
-    pending = { full: true, affectedMessageIds: new Set() };
+    pending = { ...pending, full: true, affectedMessageIds: new Set() };
   }
   if (!pending) return incoming;
-  if (pending.full) return pending;
-  if (incoming.full) return { full: true, affectedMessageIds: new Set() };
-  for (const messageId of incoming.affectedMessageIds) pending.affectedMessageIds.add(messageId);
-  return pending;
+  const before = {
+    mode: pending.full ? "full" : "surgical",
+    reasons: [...pending.reasons],
+    affected_count: pending.affectedMessageIds.size,
+  };
+  let result: RebuildIntent;
+  if (pending.full) {
+    result = pending;
+  } else if (incoming.full) {
+    result = {
+      full: true,
+      affectedMessageIds: new Set(pending.affectedMessageIds),
+      reasons: new Set(pending.reasons),
+      traceIds: new Set(pending.traceIds),
+    };
+  } else {
+    result = pending;
+  }
+  for (const messageId of incoming.affectedMessageIds) result.affectedMessageIds.add(messageId);
+  for (const reason of incoming.reasons) result.reasons.add(reason);
+  for (const traceId of incoming.traceIds) result.traceIds.add(traceId);
+  logRebuild("merged", {
+    ...(chatId ? { chat: chatId } : {}),
+    existing_mode: before.mode,
+    incoming_mode: incoming.full ? "full" : "surgical",
+    resulting_mode: result.full ? "full" : "surgical",
+    reasons_before: before.reasons,
+    reasons_after: [...result.reasons],
+    affected_count_before: before.affected_count,
+    affected_count_after: result.affectedMessageIds.size,
+    full_dominated: !pending.full && incoming.full,
+    trace_ids: [...result.traceIds],
+  });
+  return result;
 }
 
 function enqueueChatChunkRebuildIntent(
@@ -4175,12 +4302,13 @@ function enqueueChatChunkRebuildIntent(
   chatId: string,
   intent: RebuildIntent,
 ): Promise<void> {
+  logRebuild("requested", { chat: chatId, ...intentLogData(intent) });
   const existing = _rebuildStates.get(chatId);
   if (existing) {
     if (existing.userId !== userId) {
       return Promise.reject(new Error(`Chat rebuild ${chatId} is already owned by another user`));
     }
-    existing.pending = mergeRebuildIntent(existing.pending, intent);
+    existing.pending = mergeRebuildIntent(existing.pending, intent, chatId);
     return existing.done;
   }
 
@@ -4243,21 +4371,59 @@ async function executeChatChunkRebuildIntent(
     kind: "chunk_rebuild",
     exclusive: true,
     run: async () => {
+      const before = getChatChunkRebuildCounts(chatId);
+      const startedAt = Date.now();
+      const fullLifecycleData = (requestedMode: "full" | "surgical") => ({
+        ...intentLogData(intent),
+        mode: "full",
+        requested_mode: requestedMode,
+      });
+      logRebuild("executing", { chat: chatId, ...intentLogData(intent), current_chunk_count: before.total, current_signed_count: before.signed, current_unsigned_count: before.unsigned });
       if (intent.full) {
-        return _rebuildChatChunksBody(userId, chatId);
+        logRebuild("full_start", { chat: chatId, ...fullLifecycleData("full"), chunks_before: before.total, signed_before: before.signed, unsigned_before: before.unsigned });
+        await _rebuildChatChunksBody(userId, chatId);
+        const after = getChatChunkRebuildCounts(chatId);
+        logRebuild("full_complete", { chat: chatId, ...fullLifecycleData("full"), chunks_before: before.total, chunks_after: after.total, signed_after: after.signed, unsigned_after: after.unsigned, duration_ms: Date.now() - startedAt });
+        return;
       }
 
       // Resolve only after this generation owns the pipeline lane. Any chunk
       // IDs replaced by an earlier generation are therefore never reused.
-      const anchorChunkId = findAnchorChunkForMessages(
+      const anchor = findAnchorChunkForMessages(
         userId,
         chatId,
         intent.affectedMessageIds,
       );
-      if (anchorChunkId === null) {
-        return _rebuildChatChunksBody(userId, chatId);
+      logRebuild("anchor_resolution", {
+        chat: chatId,
+        trace_ids: [...intent.traceIds],
+        result_chunk_id: anchor.anchorChunkId ? shortId(anchor.anchorChunkId) : null,
+        reason: anchor.reason,
+        topology_valid: anchor.topologyValid,
+        total_chunk_count: anchor.totalChunks,
+        matched_affected_message_count: anchor.matchedMessageIds.length,
+      });
+      if (anchor.anchorChunkId === null) {
+        logRebuild("FALLBACK_FULL", { chat: chatId, trace_ids: [...intent.traceIds], originally_requested_mode: "surgical", fallback_reason: anchor.reason, reasons: [...intent.reasons], affected_count: intent.affectedMessageIds.size, affected_ids: [...intent.affectedMessageIds].map(shortId) }, "warn");
+        logRebuild("full_start", { chat: chatId, ...fullLifecycleData("surgical"), chunks_before: before.total, signed_before: before.signed, unsigned_before: before.unsigned });
+        await _rebuildChatChunksBody(userId, chatId);
+        const after = getChatChunkRebuildCounts(chatId);
+        logRebuild("full_complete", { chat: chatId, ...fullLifecycleData("surgical"), chunks_before: before.total, chunks_after: after.total, signed_after: after.signed, unsigned_after: after.unsigned, duration_ms: Date.now() - startedAt });
+        return;
       }
-      return _rebuildChatChunksFromBody(userId, chatId, anchorChunkId);
+      const topology = getChatChunkTopology(userId, chatId);
+      const anchorIndex = topology.chunks.findIndex(chunk => chunk.id === anchor.anchorChunkId);
+      const preservedChunkCount = Math.max(0, anchorIndex);
+      const preservedEndMessageId = topology.chunks[anchorIndex - 1]?.end_message_id;
+      const preservedEndIndex = preservedEndMessageId
+        ? topology.messages.findIndex(message => message.id === preservedEndMessageId)
+        : -1;
+      const messagesRechunked = preservedEndIndex >= 0
+        ? topology.messages.length - preservedEndIndex - 1
+        : topology.messages.length;
+      await _rebuildChatChunksFromBody(userId, chatId, anchor.anchorChunkId);
+      const after = getChatChunkRebuildCounts(chatId);
+      logRebuild("surgical_complete", { chat: chatId, ...intentLogData(intent), preserved_chunk_count: preservedChunkCount, rebuilt_chunk_count: Math.max(0, after.total - preservedChunkCount), messages_rechunked: messagesRechunked, duration_ms: Date.now() - startedAt });
     },
   });
 }
@@ -4270,11 +4436,8 @@ async function executeChatChunkRebuildIntent(
  * pending dominates surgical work in that generation; mutations arriving
  * after it is claimed are retained for a later generation.
  */
-export async function rebuildChatChunks(userId: string, chatId: string): Promise<void> {
-  return enqueueChatChunkRebuildIntent(userId, chatId, {
-    full: true,
-    affectedMessageIds: new Set(),
-  });
+export async function rebuildChatChunks(userId: string, chatId: string, reason: RebuildReason = "unknown"): Promise<void> {
+  return enqueueChatChunkRebuildIntent(userId, chatId, createRebuildIntent(true, [], reason));
 }
 
 /**
@@ -4292,16 +4455,18 @@ export async function rebuildChatChunksFromMessages(
   userId: string,
   chatId: string,
   affectedMessageIds: Iterable<string>,
+  reason: RebuildReason = "unknown",
 ): Promise<void> {
   // Materialize immediately: callers may supply one-shot or mutable iterables.
   const messageIds = new Set(affectedMessageIds);
-  return enqueueChatChunkRebuildIntent(userId, chatId, {
+  return enqueueChatChunkRebuildIntent(userId, chatId, createRebuildIntent(
     // Empty input has historically required the safe full-rebuild path. Make
     // that intent explicit before merging so a later surgical request cannot
     // weaken it by adding IDs to an otherwise-empty pending generation.
-    full: messageIds.size === 0,
-    affectedMessageIds: messageIds,
-  });
+    messageIds.size === 0,
+    messageIds,
+    reason,
+  ));
 }
 
 async function _rebuildChatChunksBody(userId: string, chatId: string): Promise<void> {

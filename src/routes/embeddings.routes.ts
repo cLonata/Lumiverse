@@ -292,7 +292,7 @@ app.post("/chats/:chatId/recompile", async (c) => {
   }
 
   // 1. Rebuild chunks in SQLite (creates chunk rows, queues async vectorization)
-  await chatsSvc.rebuildChatChunks(userId, chatId);
+  await chatsSvc.rebuildChatChunks(userId, chatId, "manual");
 
   // 2. Gather the freshly created chunks and embed them synchronously
   const chunks = chatsSvc.getChatChunks(userId, chatId);
