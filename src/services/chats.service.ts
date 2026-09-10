@@ -2921,6 +2921,9 @@ export function bulkDeleteMessages(userId: string, chatId: string, messageIds: s
   if (messageIds.length > 500) throw new Error("Maximum 500 messages per batch");
 
   const db = getDb();
+  // Capture the canonical boundary while the messages are still represented by
+  // their chunks. After deletion the old suffix is intentionally invalid.
+  const deletionAnchor = captureRebuildAnchor(userId, chatId, messageIds, "pre_delete");
   const getStmt = db.query("SELECT id, extra FROM messages WHERE id = ? AND chat_id = ?");
   const deleteStmt = db.query("DELETE FROM messages WHERE id = ? AND chat_id = ?");
 
@@ -2965,7 +2968,7 @@ export function bulkDeleteMessages(userId: string, chatId: string, messageIds: s
       memoryCortex.invalidateLinkedCortexCache(chatId);
     } catch { /* ignore if not loaded */ }
 
-    rebuildChatChunksFromMessages(userId, chatId, deletedIds, "bulk_delete").catch(err => {
+    rebuildChatChunksFromMessages(userId, chatId, deletedIds, "bulk_delete", deletionAnchor).catch(err => {
       console.warn("[chats] Failed to rebuild chunks after bulk delete:", err);
     });
   }
@@ -2976,6 +2979,7 @@ export function bulkDeleteMessages(userId: string, chatId: string, messageIds: s
 export function deleteMessage(userId: string, id: string): boolean {
   const msg = getMessage(userId, id);
   if (!msg) return false;
+  const deletionAnchor = captureRebuildAnchor(userId, msg.chat_id, [id], "pre_delete");
   const attachmentsToCleanup = collectMessageAttachments(msg);
   const result = getDb().query("DELETE FROM messages WHERE id = ? AND chat_id = ?").run(id, msg.chat_id);
   if (result.changes > 0) {
@@ -2994,7 +2998,7 @@ export function deleteMessage(userId: string, id: string): boolean {
       memoryCortex.invalidateLinkedCortexCache(msg.chat_id);
     } catch { /* ignore if not loaded */ }
 
-    rebuildChatChunksFromMessages(userId, msg.chat_id, [id], "message_delete").catch(err => {
+    rebuildChatChunksFromMessages(userId, msg.chat_id, [id], "message_delete", deletionAnchor).catch(err => {
       console.warn("[chats] Failed to rebuild chunks after message delete:", err);
     });
   }
@@ -4171,6 +4175,15 @@ export interface RebuildIntent {
   affectedMessageIds: Set<string>;
   reasons: Set<RebuildReason>;
   traceIds: Set<string>;
+  capturedAnchors: CapturedRebuildAnchor[];
+}
+
+interface CapturedRebuildAnchor {
+  chunkId: string;
+  chunkIndex: number;
+  prefixChunkIds: string[];
+  preservedEndMessageId: string | null;
+  source: "pre_delete" | "request";
 }
 
 let rebuildTraceSequence = 0;
@@ -4180,13 +4193,77 @@ function nextRebuildTraceId(): string {
   return `${Date.now().toString(36)}-${rebuildTraceSequence.toString(36)}`;
 }
 
-export function createRebuildIntent(full: boolean, affectedMessageIds: Iterable<string>, reason: RebuildReason = "unknown"): RebuildIntent {
+export function createRebuildIntent(full: boolean, affectedMessageIds: Iterable<string>, reason: RebuildReason = "unknown", capturedAnchor?: CapturedRebuildAnchor | null): RebuildIntent {
   return {
     full,
     affectedMessageIds: new Set(affectedMessageIds),
     reasons: new Set([reason]),
     traceIds: new Set([nextRebuildTraceId()]),
+    capturedAnchors: capturedAnchor ? [capturedAnchor] : [],
   };
+}
+
+function captureRebuildAnchor(
+  userId: string,
+  chatId: string,
+  messageIds: Iterable<string>,
+  source: CapturedRebuildAnchor["source"],
+): CapturedRebuildAnchor | null {
+  try {
+    const resolution = findAnchorChunkForMessages(userId, chatId, messageIds);
+    if (resolution.anchorChunkId && resolution.topologyValid) {
+      const topology = getChatChunkTopology(userId, chatId);
+      const chunkIndex = topology.chunks.findIndex(chunk => chunk.id === resolution.anchorChunkId);
+      if (chunkIndex >= 0) {
+        return {
+          chunkId: resolution.anchorChunkId,
+          chunkIndex,
+          prefixChunkIds: topology.chunks.slice(0, chunkIndex).map(chunk => chunk.id),
+          preservedEndMessageId: topology.chunks[chunkIndex - 1]?.end_message_id ?? null,
+          source,
+        };
+      }
+    }
+
+    // A prior queued deletion can make only its suffix invalid. A later
+    // deletion may still have a safe earlier boundary, provided every chunk
+    // before that boundary remains a complete valid partition of the current
+    // message prefix. Never infer a boundary from an invalid prefix.
+    const ids = new Set(messageIds);
+    const messages = getMessages(userId, chatId).filter(message => message.extra?.hidden !== true);
+    const positions = new Map(messages.map((message, index) => [message.id, index]));
+    const entries = getCanonicalChatChunkRows(chatId).map(row => {
+      let chunkMessageIds: string[] = [];
+      try {
+        const parsed: unknown = JSON.parse(row.message_ids);
+        if (Array.isArray(parsed) && parsed.every(id => typeof id === "string")) chunkMessageIds = parsed;
+      } catch { /* validated below */ }
+      return { row, chunkMessageIds, start: positions.get(row.start_message_id) };
+    });
+    const candidate = entries
+      .filter(entry => entry.start !== undefined && entry.chunkMessageIds.some(id => ids.has(id)))
+      .sort((a, b) => a.start! - b.start!)[0];
+    if (!candidate || candidate.start === undefined) return null;
+    const prefix = entries
+      .filter(entry => entry.start !== undefined && entry.start < candidate.start!)
+      .sort((a, b) => a.start! - b.start!);
+    const prefixTopology = validateChatChunkTopology(
+      prefix.map(entry => entry.row),
+      messages.slice(0, candidate.start),
+    );
+    if (!prefixTopology.valid || !prefixTopology.complete) return null;
+    return {
+      chunkId: candidate.row.id,
+      chunkIndex: prefix.length,
+      prefixChunkIds: prefix.map(entry => entry.row.id),
+      preservedEndMessageId: prefix.at(-1)?.row.end_message_id ?? null,
+      source,
+    };
+  } catch {
+    // Minimal/test schemas may not have chunk tables; the normal rebuild path
+    // retains its established fallback behavior in that case.
+    return null;
+  }
 }
 
 function shortId(id: string): string {
@@ -4234,6 +4311,7 @@ interface ChatRebuildState {
   userId: string;
   chatId: string;
   pending: RebuildIntent | null;
+  active: RebuildIntent | null;
   done: Promise<void>;
   resolveDone: () => void;
   rejectDone: (reason?: unknown) => void;
@@ -4246,6 +4324,15 @@ interface ChatRebuildState {
  * retained as the next generation rather than being silently subsumed.
  */
 const _rebuildStates = new Map<string, ChatRebuildState>();
+
+function mergeCapturedAnchors(existing: CapturedRebuildAnchor[], incoming: CapturedRebuildAnchor[]): CapturedRebuildAnchor[] {
+  const anchors = new Map(existing.map(anchor => [anchor.chunkId, anchor]));
+  for (const anchor of incoming) {
+    const previous = anchors.get(anchor.chunkId);
+    if (!previous || anchor.chunkIndex < previous.chunkIndex || anchor.source === "pre_delete") anchors.set(anchor.chunkId, anchor);
+  }
+  return [...anchors.values()];
+}
 
 export function isChatChunkRebuildInProgress(chatId: string): boolean {
   return _rebuildStates.has(chatId);
@@ -4275,6 +4362,7 @@ export function mergeRebuildIntent(pending: RebuildIntent | null, incoming: Rebu
       affectedMessageIds: new Set(pending.affectedMessageIds),
       reasons: new Set(pending.reasons),
       traceIds: new Set(pending.traceIds),
+      capturedAnchors: [...pending.capturedAnchors],
     };
   } else {
     result = pending;
@@ -4282,6 +4370,7 @@ export function mergeRebuildIntent(pending: RebuildIntent | null, incoming: Rebu
   for (const messageId of incoming.affectedMessageIds) result.affectedMessageIds.add(messageId);
   for (const reason of incoming.reasons) result.reasons.add(reason);
   for (const traceId of incoming.traceIds) result.traceIds.add(traceId);
+  result.capturedAnchors = mergeCapturedAnchors(result.capturedAnchors, incoming.capturedAnchors);
   logRebuild("merged", {
     ...(chatId ? { chat: chatId } : {}),
     existing_mode: before.mode,
@@ -4308,6 +4397,18 @@ function enqueueChatChunkRebuildIntent(
     if (existing.userId !== userId) {
       return Promise.reject(new Error(`Chat rebuild ${chatId} is already owned by another user`));
     }
+    // A deletion arriving while an earlier generation is awaiting the
+    // exclusive lane must contribute its pre-mutation boundary immediately.
+    // Otherwise the active later anchor could preserve the newly deleted
+    // earlier chunk before the pending generation gets a chance to run.
+    if (!existing.active?.full && !intent.full) {
+      existing.active.capturedAnchors = mergeCapturedAnchors(existing.active.capturedAnchors, intent.capturedAnchors);
+      // Keep the active generation's earliest boundary on the pending intent
+      // too. If the active pass has already selected its scope, the next pass
+      // can still rebuild from that proven prefix instead of rediscovering a
+      // deleted message in the newly rechunked suffix.
+      intent.capturedAnchors = mergeCapturedAnchors(intent.capturedAnchors, existing.active.capturedAnchors);
+    }
     existing.pending = mergeRebuildIntent(existing.pending, intent, chatId);
     return existing.done;
   }
@@ -4322,6 +4423,7 @@ function enqueueChatChunkRebuildIntent(
     userId,
     chatId,
     pending: intent,
+    active: null,
     done,
     resolveDone,
     rejectDone,
@@ -4350,7 +4452,12 @@ async function drainChatChunkRebuildState(state: ChatRebuildState): Promise<void
 
       // New requests now accumulate independently as the next generation.
       state.pending = null;
-      await executeChatChunkRebuildIntent(state.userId, state.chatId, intent);
+      state.active = intent;
+      try {
+        await executeChatChunkRebuildIntent(state.userId, state.chatId, intent);
+      } finally {
+        state.active = null;
+      }
     }
   } catch (err) {
     state.pending = null;
@@ -4402,7 +4509,24 @@ async function executeChatChunkRebuildIntent(
         topology_valid: anchor.topologyValid,
         total_chunk_count: anchor.totalChunks,
         matched_affected_message_count: anchor.matchedMessageIds.length,
+        captured_anchor: intent.capturedAnchors[0]?.chunkId ? shortId(intent.capturedAnchors[0].chunkId) : null,
+        captured_anchor_index: intent.capturedAnchors[0]?.chunkIndex ?? null,
+        anchor_source: intent.capturedAnchors[0]?.source ?? null,
+        captured_anchor_indices: intent.capturedAnchors.map(candidate => candidate.chunkIndex),
       });
+      const capturedAnchor = [...intent.capturedAnchors].sort((a, b) => a.chunkIndex - b.chunkIndex)[0] ?? null;
+      const resolvedIndex = anchor.anchorChunkId === null
+        ? Number.POSITIVE_INFINITY
+        : getChatChunkTopology(userId, chatId).chunks.findIndex(chunk => chunk.id === anchor.anchorChunkId);
+      if (capturedAnchor && capturedAnchor.chunkIndex <= resolvedIndex) {
+        const rebuilt = await _rebuildChatChunksFromCapturedAnchorBody(userId, chatId, intent);
+        if (rebuilt) {
+          const appliedAnchor = [...intent.capturedAnchors].sort((a, b) => a.chunkIndex - b.chunkIndex)[0]!;
+          const after = getChatChunkRebuildCounts(chatId);
+          logRebuild("surgical_complete", { chat: chatId, ...intentLogData(intent), preserved_chunk_count: appliedAnchor.prefixChunkIds.length, rebuilt_chunk_count: Math.max(0, after.total - appliedAnchor.prefixChunkIds.length), captured_anchor: shortId(appliedAnchor.chunkId), captured_anchor_index: appliedAnchor.chunkIndex, anchor_source: appliedAnchor.source, duration_ms: Date.now() - startedAt });
+          return;
+        }
+      }
       if (anchor.anchorChunkId === null) {
         logRebuild("FALLBACK_FULL", { chat: chatId, trace_ids: [...intent.traceIds], originally_requested_mode: "surgical", fallback_reason: anchor.reason, reasons: [...intent.reasons], affected_count: intent.affectedMessageIds.size, affected_ids: [...intent.affectedMessageIds].map(shortId) }, "warn");
         logRebuild("full_start", { chat: chatId, ...fullLifecycleData("surgical"), chunks_before: before.total, signed_before: before.signed, unsigned_before: before.unsigned });
@@ -4456,6 +4580,7 @@ export async function rebuildChatChunksFromMessages(
   chatId: string,
   affectedMessageIds: Iterable<string>,
   reason: RebuildReason = "unknown",
+  capturedAnchor?: CapturedRebuildAnchor | null,
 ): Promise<void> {
   // Materialize immediately: callers may supply one-shot or mutable iterables.
   const messageIds = new Set(affectedMessageIds);
@@ -4466,6 +4591,7 @@ export async function rebuildChatChunksFromMessages(
     messageIds.size === 0,
     messageIds,
     reason,
+    capturedAnchor ?? captureRebuildAnchor(userId, chatId, messageIds, "request"),
   ));
 }
 
@@ -4675,4 +4801,63 @@ async function _rebuildChatChunksFromBody(userId: string, chatId: string, fromCh
   scheduleChatMemoryRefresh(userId, chatId, 9);
 
   console.info(`[chats] Surgically rebuilt chat ${chatId}: ${discardedChunkIds.length} chunks → re-chunked ${messagesToChunk.length} messages (${fromIdx} chunks preserved)`);
+}
+
+/**
+ * Rebuild a deletion suffix using a boundary captured before the deleted rows
+ * made the old full graph invalid. Only the captured prefix is trusted, and
+ * it is independently validated against the post-delete visible messages.
+ */
+async function _rebuildChatChunksFromCapturedAnchorBody(
+  userId: string,
+  chatId: string,
+  intent: RebuildIntent,
+): Promise<boolean> {
+  invalidateChatMemoryCache(chatId);
+  const cfg = await embeddingsSvc.getEmbeddingConfig(userId);
+  if (!cfg.enabled || !cfg.vectorize_chat_messages) return false;
+  // This awaits configuration, which gives same-turn mutations a chance to
+  // merge their pre-delete provenance into the active generation.
+  const anchor = [...intent.capturedAnchors].sort((a, b) => a.chunkIndex - b.chunkIndex)[0];
+  if (!anchor) return false;
+
+  const allMessages = getMessages(userId, chatId).filter(message => message.extra?.hidden !== true);
+  const preservedEndIndex = anchor.preservedEndMessageId === null
+    ? -1
+    : allMessages.findIndex(message => message.id === anchor.preservedEndMessageId);
+  if (anchor.preservedEndMessageId !== null && preservedEndIndex < 0) return false;
+
+  const rows = getDb().query("SELECT * FROM chat_chunks WHERE chat_id = ?").all(chatId) as any[];
+  const rowById = new Map(rows.map(row => [row.id, row]));
+  const prefixRows = anchor.prefixChunkIds.map(id => rowById.get(id));
+  if (prefixRows.some(row => !row)) return false;
+  const prefixTopology = validateChatChunkTopology(
+    prefixRows as any[],
+    allMessages.slice(0, preservedEndIndex + 1),
+  );
+  if (!prefixTopology.valid || !prefixTopology.complete) return false;
+
+  const prefixIds = new Set(anchor.prefixChunkIds);
+  const discardedChunkIds = rows.filter(row => !prefixIds.has(row.id)).map(row => row.id as string);
+  const messagesToChunk = allMessages.slice(preservedEndIndex + 1);
+  const salienceByContent = snapshotSalienceForChunks(userId, chatId, discardedChunkIds);
+  try {
+    await embeddingsSvc.deleteChatChunkEmbeddings(userId, chatId, discardedChunkIds);
+  } catch (err) {
+    console.warn(`[chats] Failed to delete LanceDB chat_chunk vectors for chat ${chatId}:`, err);
+  }
+  if (discardedChunkIds.length > 0) {
+    const placeholders = discardedChunkIds.map(() => "?").join(",");
+    getDb().query(`DELETE FROM chat_chunks WHERE id IN (${placeholders})`).run(...discardedChunkIds);
+  }
+  if (messagesToChunk.length > 0) {
+    const settings = embeddingsSvc.resolveEffectiveChatMemorySettings(
+      embeddingsSvc.loadChatMemorySettings(userId),
+      cfg,
+    );
+    await chunkAndPersistMessages(userId, chatId, messagesToChunk, settings, salienceByContent);
+  }
+  stampChatMemoryHash(userId, chatId);
+  scheduleChatMemoryRefresh(userId, chatId, 9);
+  return true;
 }
